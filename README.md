@@ -10,7 +10,7 @@
 На Debian 10, 11, 12 или 13 (можно на голую систему):
 
 ```bash
-git clone <этот репозиторий> web-share && cd web-share
+git clone https://github.com/DrVidjet/web-share web-share && cd web-share
 cp .env.example .env     # по желанию: поправить значения по умолчанию (все настройки - в этом файле)
 sudo ./start.sh
 ```
