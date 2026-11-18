@@ -45,6 +45,7 @@ read_kv() {         # read_kv файл -> PRE[...] (не перетирает у
     k=${line%%=*}; v=${line#*=}; k=${k//[[:space:]]/}
     [ -n "$k" ] && [ -z "${PRE[$k]+x}" ] && PRE[$k]=$v
   done < "$1"
+  return 0  # иначе set -e роняет скрипт, если ключ последней строки уже задан
 }
 read_proj() {
   local f=$SRC/.env k v
@@ -55,6 +56,7 @@ read_proj() {
     k=${line%%=*}; v=${line#*=}; k=${k//[[:space:]]/}
     [ -n "$k" ] && [ -n "$v" ] && PROJ[$k]=$v
   done < "$f"
+  return 0
 }
 read_proj
 # setting ПЕРЕМЕННАЯ "по умолчанию" - без вопроса (редкие настройки: только из --answers / .env)
@@ -156,6 +158,10 @@ if [ "$UNINSTALL" = 1 ]; then
   systemctl daemon-reload
   ask_yn DEL_DIR "Удалить папку установки $INSTALL_DIR (код, venv, .env)?" y
   [ "$DEL_DIR" = y ] && rm -rf "$INSTALL_DIR"
+  if [ -d "/var/lib/$SERVICE" ]; then
+    ask_yn DEL_STATE "Удалить комментарии к файлам (/var/lib/$SERVICE)?" y
+    [ "$DEL_STATE" = y ] && rm -rf "/var/lib/$SERVICE"
+  fi
   echo "Готово. Общая папка ${PRE[SHARE_ROOT]:-} и пользователи не тронуты."
   exit 0
 fi
@@ -190,6 +196,7 @@ fi
 ask SHARE_SMB_PATHS "Пути Samba для показа в шапке (через запятую, пусто — не показывать)" "$SMB_DEF"
 
 setting SHARE_SESSION_HOURS 12
+setting SHARE_COMMENTS_FILE ""
 setting INSTALL_SMB_WORM_GRACE 30
 RUN_USER=$INSTALL_RUN_USER
 # ---------------------------------------------------------------- установка
@@ -227,7 +234,7 @@ umask 077
 {
   echo "# $APP: настройки (создано start.sh $(date '+%F %T')). После правки: systemctl restart $SERVICE"
   for k in SHARE_ROOT SHARE_PORT SHARE_BIND SHARE_ALLOW SHARE_TITLE SHARE_SMB_PATHS SHARE_USER SHARE_PASS \
-           SHARE_UPLOAD_USER SHARE_UPLOAD_PASS SHARE_UPLOAD_DIR SHARE_SESSION_HOURS; do echo "$k=${!k}"; done
+           SHARE_UPLOAD_USER SHARE_UPLOAD_PASS SHARE_UPLOAD_DIR SHARE_SESSION_HOURS SHARE_COMMENTS_FILE; do echo "$k=${!k}"; done
   echo "# для start.sh (приложение не читает)"
   for k in INSTALL_SERVICE INSTALL_RUN_USER INSTALL_DOCKER_INDEX_DIR INSTALL_SAMBA INSTALL_SMB_NAME INSTALL_SMB_WORM_GRACE; do echo "$k=${!k-}"; done
 } > "$cfg.tmp"
@@ -251,6 +258,9 @@ WorkingDirectory=$INSTALL_DIR
 User=$RUN_USER
 Group=$RUN_GROUP
 UMask=0002
+# /var/lib/$SERVICE - комментарии к файлам (comments.json), если SHARE_COMMENTS_FILE не задан
+StateDirectory=$SERVICE
+StateDirectoryMode=0750
 Restart=on-failure
 RestartSec=5
 

@@ -73,6 +73,63 @@ SESSION_TTL = int(float(C.get("SHARE_SESSION_HOURS", "12")) * 3600)
 SESSIONS = {}  # токен -> [время истечения, роль]
 SLOCK = threading.Lock()
 ARCH_LIMIT = 20000
+# комментарии к файлам/папкам: {путь от корня: текст}. По умолчанию - StateDirectory службы (/var/lib/<служба>)
+COMMENTS_FILE = C.get("SHARE_COMMENTS_FILE") or os.path.join(
+    os.environ.get("STATE_DIRECTORY", "").split(":")[0] or os.path.dirname(os.path.realpath(__file__)), "comments.json")
+COMMENT_MAX = 1000
+CLOCK = threading.Lock()
+
+
+def comments_load():
+    try:
+        with open(COMMENTS_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return {str(k): str(v) for k, v in d.items() if v} if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print("web-share: не прочитать %s: %s" % (COMMENTS_FILE, e), flush=True)
+        return {}
+
+
+COMMENTS = comments_load()
+
+
+def comments_save():
+    """Вызывать под CLOCK."""
+    tmp = COMMENTS_FILE + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(COMMENTS, f, ensure_ascii=False, indent=1, sort_keys=True)
+        os.replace(tmp, COMMENTS_FILE)
+    except OSError as e:
+        raise Err(500, "Не сохранить комментарии (%s): %s" % (COMMENTS_FILE, e))
+
+
+def comments_under(rel):
+    """Ключи комментариев самого rel и всего, что внутри него."""
+    return [k for k in COMMENTS if k == rel or k.startswith(rel + "/")]
+
+
+def comments_move(src_rel, dst_rel, copy=False):
+    """Комментарии вслед за переименованием/перемещением/копированием (вместе с содержимым папки)."""
+    with CLOCK:
+        keys = comments_under(src_rel)
+        if not keys:
+            return
+        for k in keys:
+            v = COMMENTS[k] if copy else COMMENTS.pop(k)
+            COMMENTS[dst_rel + k[len(src_rel):]] = v
+        comments_save()
+
+
+def comments_drop(rel):
+    with CLOCK:
+        keys = comments_under(rel)
+        for k in keys:
+            del COMMENTS[k]
+        if keys:
+            comments_save()
 
 
 class Err(Exception):
@@ -384,8 +441,10 @@ class H(BaseHTTPRequestHandler):
                 return self.login(d)
             if route == "/api/logout":
                 return self.logout()
-            if route in ("/api/rename", "/api/delete", "/api/paste"):
+            if route in ("/api/rename", "/api/delete", "/api/paste", "/api/comment"):
                 self.need_admin()
+            if route == "/api/exists":
+                return self.api_exists(d)
             if route == "/api/mkdir":
                 parent = resolve(d.get("path"))
                 self.need_write(parent)
@@ -400,6 +459,7 @@ class H(BaseHTTPRequestHandler):
                 if os.path.lexists(dst):
                     raise Err(409, "Уже существует: " + os.path.basename(dst))
                 os.rename(src, dst)
+                comments_move(relpath(src), relpath(dst))
                 self.send_json({"ok": True})
             elif route == "/api/delete":
                 for r in d.get("paths", []):
@@ -410,9 +470,22 @@ class H(BaseHTTPRequestHandler):
                         shutil.rmtree(p)
                     else:
                         os.remove(p)
+                    comments_drop(relpath(p))
                 self.send_json({"ok": True})
             elif route == "/api/paste":
                 self.paste(d)
+            elif route == "/api/comment":
+                p = resolve(d.get("path"))
+                if p == ROOT:
+                    raise Err(400, "Корню комментарий не нужен")
+                text = " ".join(str(d.get("text", "")).split())[:COMMENT_MAX]
+                with CLOCK:
+                    if text:
+                        COMMENTS[relpath(p)] = text
+                    else:
+                        COMMENTS.pop(relpath(p), None)
+                    comments_save()
+                self.send_json({"ok": True, "text": text})
             else:
                 self.send_error(404)
         except (BrokenPipeError, ConnectionResetError):
@@ -426,15 +499,18 @@ class H(BaseHTTPRequestHandler):
         if not os.path.isdir(p):
             raise Err(400, "Не папка")
         items = []
+        base = relpath(p)
         with os.scandir(p) as it:
             for de in it:
                 try:
                     st = de.stat(follow_symlinks=True)
                     isdir = stat.S_ISDIR(st.st_mode)
-                    items.append({"name": de.name, "dir": isdir,
-                                  "size": dir_size(de.path) if isdir else st.st_size, "mtime": st.st_mtime})
+                    item = {"name": de.name, "dir": isdir,
+                            "size": dir_size(de.path) if isdir else st.st_size, "mtime": st.st_mtime}
                 except OSError:
-                    items.append({"name": de.name, "dir": False, "size": 0, "mtime": 0})
+                    item = {"name": de.name, "dir": False, "size": 0, "mtime": 0}
+                item["comment"] = COMMENTS.get(os.path.join(base, de.name), "")
+                items.append(item)
         du = shutil.disk_usage(p)
         self.send_json({"path": relpath(p), "items": items,
                         "free": du.free, "total": du.total})
@@ -445,7 +521,7 @@ class H(BaseHTTPRequestHandler):
         st = os.stat(p)
         isdir = stat.S_ISDIR(st.st_mode)
         info = {"path": relpath(p), "name": os.path.basename(p) or "share", "dir": isdir,
-                "mtime": st.st_mtime, "size": st.st_size}
+                "mtime": st.st_mtime, "size": st.st_size, "comment": COMMENTS.get(relpath(p), "")}
         if isdir:
             files = dirs = 0
             for _, ds, fs in os.walk(p):
@@ -548,6 +624,19 @@ class H(BaseHTTPRequestHandler):
             with gzip.open(p, "rb") as f:
                 shutil.copyfileobj(f, self.wfile, CHUNK)
 
+    def api_exists(self, d):
+        """Какие из names (пути от path, могут быть с подпапками) уже существуют - перед загрузкой."""
+        base = resolve(d.get("path"))
+        out = []
+        for name in d.get("names", []):
+            parts = [x for x in str(name).split("/") if x]
+            if not parts or any(x in (".", "..") or "\0" in x for x in parts):
+                continue
+            p = os.path.join(base, *parts)
+            if os.path.realpath(p).startswith(ROOT + os.sep) and os.path.lexists(p):
+                out.append(name)
+        self.send_json({"exists": out})
+
     def upload(self):
         d = resolve(self.qget("path"))
         if not os.path.isdir(d):
@@ -603,12 +692,14 @@ class H(BaseHTTPRequestHandler):
                 if os.path.lexists(dst):
                     raise Err(409, "В папке назначения уже есть: " + os.path.basename(src))
                 shutil.move(src, dst)
+                comments_move(relpath(src), relpath(dst))
             elif op == "copy":
                 dst = unique_dest(dest, os.path.basename(src))
                 if os.path.isdir(src) and not os.path.islink(src):
                     shutil.copytree(src, dst, symlinks=True)
                 else:
                     shutil.copy2(src, dst, follow_symlinks=False)
+                comments_move(relpath(src), relpath(dst), copy=True)
             else:
                 raise Err(400, "Неизвестная операция")
         self.send_json({"ok": True})
@@ -642,7 +733,11 @@ td.r,th.r{text-align:right;white-space:nowrap}
 .ic{display:inline-block;width:20px}
 #drop{display:none;position:fixed;inset:0;background:rgba(42,110,187,.15);border:4px dashed #2a6ebb;z-index:9;align-items:center;justify-content:center;font-size:28px;color:#2a6ebb}
 #up{margin:0 16px 10px}
-.upi{font-size:13px;margin:3px 0}
+.upi{font-size:13px;margin:3px 0;padding:8px 10px;background:#fff;border:1px solid #ddd;border-radius:4px}
+.upi .pb{margin-top:6px}
+.upc{color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.upx{padding:1px 8px;font-size:12px;margin-left:6px}
+.upi details{margin-top:6px;max-height:160px;overflow:auto}
 .pb{height:6px;background:#e5e7eb;border-radius:3px;overflow:hidden}
 .pb div{height:100%;background:#2a6ebb;width:0}
 #modal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:10;align-items:center;justify-content:center}
@@ -655,11 +750,21 @@ body.ro .rw{display:none}
 body:not(.cw) .w{display:none}
 body.anon .lo{display:none}
 #who{margin-left:auto;align-self:center;font-size:13px;color:#555}
+#cmodal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:11;align-items:center;justify-content:center}
+#cmodal .w{background:#fff;padding:18px 20px;border-radius:6px;width:min(560px,94vw);display:flex;flex-direction:column;gap:10px}
+#cml{max-height:50vh;overflow:auto;font-size:13px;border:1px solid #ddd;border-radius:4px;padding:6px 8px;word-break:break-all}
+#cmodal .row{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}
 #lmodal{display:none;position:fixed;inset:0;background:rgba(0,0,0,.4);z-index:11;align-items:center;justify-content:center}
 #lmodal form{background:#fff;padding:18px 20px;border-radius:6px;width:300px;display:flex;flex-direction:column;gap:9px}
 #lmodal input{padding:7px;font-size:14px;border:1px solid #b9c2cc;border-radius:4px}
 #lmodal .row{display:flex;gap:8px;justify-content:flex-end}
 .err{color:#c9302c}
+td.cm{color:#555;max-width:40vw;overflow-wrap:anywhere}
+body:not(.ro) td.cm{cursor:text}
+body:not(.ro) td.cm:hover{background:#fffbe6}
+body:not(.ro) td.cm:empty::before{content:"✎";opacity:0;color:#999}
+body:not(.ro) tr:hover td.cm:empty::before{opacity:.6}
+td.cm input{width:100%;box-sizing:border-box;font-size:14px;padding:3px 5px;border:1px solid #2a6ebb;border-radius:3px}
 td.sh,th.sh{width:30px;text-align:center;padding:2px 0}
 .shb{border:none;background:transparent;padding:3px 6px;border-radius:6px;font-size:15px;opacity:.6;transition:opacity .15s,background .15s}
 tr:hover .shb{opacity:.85}
@@ -691,7 +796,7 @@ tr:hover .shb{opacity:.85}
 <div id="clip"></div>
 <div id="up"></div>
 <table><thead><tr><th style="width:24px"><input type="checkbox" id="all"></th><th class="sh" title="Поделиться ссылкой"></th>
-<th data-k="name">Имя</th><th class="r" data-k="size">Размер</th><th class="r" data-k="mtime">Изменён</th></tr></thead>
+<th data-k="name">Имя</th><th data-k="comment">Комментарий</th><th class="r" data-k="size">Размер</th><th class="r" data-k="mtime">Изменён</th></tr></thead>
 <tbody id="tb"></tbody></table>
 <div id="st"></div>
 <input type="file" id="fi" multiple style="display:none">
@@ -699,6 +804,8 @@ tr:hover .shb{opacity:.85}
 <div id="drop">Отпустите файлы для загрузки</div>
 <div id="toast"><span>✅</span><span id="tm">Ссылка скопирована</span><span class="tl" id="tl"></span></div>
 <div id="modal"><div class="w"><div class="h"><b id="mt"></b><button id="mc">✕ Закрыть</button></div><div class="b" id="mb"></div></div></div>
+<div id="cmodal"><div class="w"><b id="cmt"></b><div id="cml"></div>
+<div class="row"><button id="cmc">Отменить загрузку</button><button id="cms">Пропустить все</button><button id="cmr" class="danger">Заменить все</button></div></div></div>
 <div id="lmodal"><form id="lf"><b>Вход для изменения файлов</b>
 <input id="lu" placeholder="Логин" autocomplete="username" required>
 <input id="lp" type="password" placeholder="Пароль" autocomplete="current-password" required>
@@ -740,16 +847,17 @@ function render(){
   $("crumbs").innerHTML = h;
   document.body.classList.toggle("cw", canWrite());
   $("crumbs").querySelectorAll("a").forEach(a => a.onclick = () => { cur = a.dataset.p; load(); });
-  const list = items.slice().sort((a,b) => (b.dir - a.dir) || (sortK === "name" ? a.name.localeCompare(b.name, "ru", {numeric:true}) : (a[sortK] - b[sortK])) * sortD);
-  let rows = cur ? '<tr data-up="1"><td></td><td></td><td class="n"><span class="ic">⤴</span>..</td><td></td><td></td></tr>' : "";
+  const list = items.slice().sort((a,b) => (b.dir - a.dir) || (sortK === "name" || sortK === "comment" ? (a[sortK] || "").localeCompare(b[sortK] || "", "ru", {numeric:true}) : (a[sortK] - b[sortK])) * sortD);
+  let rows = cur ? '<tr data-up="1"><td></td><td></td><td class="n"><span class="ic">⤴</span>..</td><td></td><td></td><td></td></tr>' : "";
   for(const it of list){
     const p = join(cur, it.name);
     rows += `<tr data-p="${esc(p)}" class="${sel.has(p)?"sel":""}"><td><input type="checkbox" ${sel.has(p)?"checked":""}></td>`+
       `<td class="sh"><button class="shb" title="Поделиться: скопировать ссылку">🔗</button></td>`+
       `<td class="n"><span class="ic">${it.dir?"📁":(ARCH.test(it.name)?"🗜":"📄")}</span>${esc(it.name)}</td>`+
+      `<td class="cm" title="${admin?"Щелчок - изменить комментарий":""}">${esc(it.comment || "")}</td>`+
       `<td class="r">${fmt(it.size)}</td><td class="r">${fdate(it.mtime)}</td></tr>`;
   }
-  $("tb").innerHTML = rows || '<tr><td></td><td colspan="4" style="color:#888">Папка пуста</td></tr>';
+  $("tb").innerHTML = rows || '<tr><td></td><td colspan="5" style="color:#888">Папка пуста</td></tr>';
   $("tb").querySelectorAll("tr").forEach(tr => {
     if(tr.dataset.up){ tr.querySelector(".n").onclick = () => { cur = cur.split("/").slice(0,-1).join("/"); load(); }; return; }
     const p = tr.dataset.p; if(!p) return;
@@ -758,9 +866,29 @@ function render(){
     tr.querySelector("input").onclick = e => { e.stopPropagation(); toggle(p, e.target.checked); };
     tr.querySelector(".n").onclick = () => open(it, p);
     tr.querySelector(".shb").onclick = e => { e.stopPropagation(); share(p); };
+    tr.querySelector(".cm").onclick = e => { if(admin) editComment(e.currentTarget, it, p); };
   });
   $("all").checked = items.length > 0 && sel.size === items.length;
   updBtns();
+}
+// ---- комментарии (только admin) ----
+function editComment(td, it, p){
+  if(td.querySelector("input")) return;
+  const inp = document.createElement("input"); inp.value = it.comment || ""; inp.maxLength = 1000;
+  inp.placeholder = "Комментарий (Enter - сохранить, Esc - отмена)";
+  td.textContent = ""; td.appendChild(inp); inp.focus();
+  let done = false;
+  const finish = async save => {
+    if(done) return; done = true;
+    const text = inp.value.trim();
+    if(save && text !== (it.comment || "")){
+      try{ const j = await api("/api/comment", {path:p, text}); it.comment = j.text; }
+      catch(e){ alert(e.message); }
+    }
+    td.textContent = it.comment || "";
+  };
+  inp.onkeydown = e => { if(e.key === "Enter") finish(true); else if(e.key === "Escape") finish(false); };
+  inp.onblur = () => finish(true);
 }
 // ---- поделиться ----
 const shareUrl = p => location.origin + "/s/" + p.split("/").map(encodeURIComponent).join("/");
@@ -845,34 +973,104 @@ async function showArchive(p){
     $("mb").innerHTML = `<table><thead><tr><th>Имя (щелчок - скачать файл)</th><th class="r">Размер</th><th class="r">Дата</th></tr></thead><tbody>${rows}</tbody></table>`;
   }catch(e){ $("mb").innerHTML = '<p class="err" style="padding:14px">'+esc(e.message)+'</p>'; }
 }
-// ---- загрузка ----
-let queue = [], busy = false;
-function enqueue(files){ if(!role){ showLogin(); return; } if(!canWrite()){ alert("Загружать можно только в папку /" + upDir); return; } for(const f of files) queue.push({f, name: f.webkitRelativePath || f.relPath || f.name, dir: cur}); pump(); }
+// ---- загрузка: одна общая шкала на всю очередь ----
+let queue = [], busy = false, xhr = null, bt = null, upHide = null, lastLoad = 0;
+function newBatch(){ return {n:0, done:0, ok:0, skip:0, total:0, sent:0, cur:"", curLoaded:0, errs:[]}; }
+async function enqueue(files){
+  if(!role){ showLogin(); return; } if(!canWrite()){ alert("Загружать можно только в папку /" + upDir); return; }
+  const dir = cur, list = [...files].map(f => ({f, name: f.webkitRelativePath || f.relPath || f.name, dir, ow: false}));
+  if(!list.length) return;
+  // одним запросом узнаём, что уже есть, и спрашиваем один раз на всю пачку
+  let ex = new Set();
+  try{ ex = new Set((await api("/api/exists", {path: dir, names: list.map(q => q.name)})).exists); }catch(e){}
+  let skipped = [], rejected = [];
+  if(ex.size){
+    const dup = list.filter(q => ex.has(q.name));
+    if(admin){
+      const a = await askConflict(dup.map(q => q.name));
+      if(a === "cancel") return;
+      if(a === "replace") dup.forEach(q => q.ow = true); else skipped = dup;
+    } else rejected = dup;
+  }
+  if(!bt || (!busy && !queue.length)) bt = newBatch();
+  clearTimeout(upHide);
+  bt.n += list.length;
+  for(const q of list){
+    if(skipped.includes(q)){ bt.done++; bt.skip++; continue; }
+    if(rejected.includes(q)){ bt.done++; bt.errs.push({name: q.name, msg: "уже существует, замена запрещена"}); continue; }
+    queue.push(q); bt.total += q.f.size;
+  }
+  upDraw();
+  if(!busy && !queue.length) upFinish(); else pump();
+}
+function askConflict(names){
+  return new Promise(res => {
+    const m = $("cmodal"), n = names.length;
+    $("cmt").textContent = n === 1 ? "Файл уже существует:" : `Уже существуют файлов: ${n}`;
+    $("cml").innerHTML = names.slice(0, 200).map(x => `<div>${esc(x)}</div>`).join("") + (n > 200 ? `<div>… и ещё ${n - 200}</div>` : "");
+    $("cmr").textContent = n === 1 ? "Заменить" : "Заменить все";
+    $("cms").textContent = n === 1 ? "Пропустить" : "Пропустить все";
+    const done = a => { m.style.display = "none"; res(a); };
+    $("cmr").onclick = () => done("replace"); $("cms").onclick = () => done("skip"); $("cmc").onclick = () => done("cancel");
+    m.style.display = "flex";
+  });
+}
+function upDraw(){
+  const el = $("up"); if(!bt){ el.innerHTML = ""; return; }
+  const fin = !busy && !queue.length, sent = bt.sent + bt.curLoaded;
+  const pct = bt.total ? Math.min(100, Math.floor(100 * sent / bt.total)) : (fin ? 100 : 0);
+  let head;
+  if(fin){
+    head = `<b>${bt.errs.length ? "Загрузка завершена с ошибками" : "Загрузка завершена"}</b>: ${bt.ok} из ${bt.n} файл(ов), ${fmt(bt.sent)}`
+      + (bt.skip ? `, пропущено ${bt.skip}` : "") + ` <button class="upx" title="Закрыть">✕</button>`;
+  } else {
+    head = `<b>Загрузка ${pct}%</b> — файлов ${bt.done} из ${bt.n}, ${fmt(sent)} из ${fmt(bt.total)}`
+      + ` <button class="upx" title="Отменить загрузку">Отменить</button><div class="upc">${esc(bt.cur)}</div>`;
+  }
+  let errs = "";
+  if(bt.errs.length) errs = `<details class="err"><summary>Ошибок: ${bt.errs.length}</summary>${bt.errs.map(e => `<div>${esc(e.name)}: ${esc(e.msg)}</div>`).join("")}</details>`;
+  el.innerHTML = `<div class="upi">${head}<div class="pb"><div style="width:${pct}%"></div></div>${errs}</div>`;
+  el.querySelector(".upx").onclick = fin ? () => { bt = null; upDraw(); } : upCancel;
+}
+function upCancel(){
+  if(!confirm("Отменить загрузку? Уже загруженные файлы останутся.")) return;
+  bt.skip += queue.length; bt.done += queue.length; queue = [];
+  if(xhr){ const x = xhr; xhr = null; x.abort(); }
+}
+function upRefresh(force){ const t = Date.now(); if(force || t - lastLoad > 2000){ lastLoad = t; load(); } }
+function upNext(q, res, msg){
+  // res: "ok" | "skip" | "err"
+  bt.done++; bt.sent += q.f.size; bt.curLoaded = 0; xhr = null;
+  if(res === "ok") bt.ok++; else if(res === "skip") bt.skip++; else bt.errs.push({name: q.name, msg});
+  busy = false;
+  if(queue.length){ if(q.dir === cur) upRefresh(false); pump(); return; }
+  upFinish();
+}
+function upFinish(){
+  upRefresh(true); upDraw();
+  if(!bt.errs.length){ const b0 = bt; upHide = setTimeout(() => { if(bt === b0 && !busy && !queue.length){ bt = null; upDraw(); } }, 5000); }
+}
 function pump(){
   if(busy || !queue.length) return;
   busy = true;
-  const q = queue.shift(), div = document.createElement("div");
-  div.className = "upi"; div.innerHTML = `${esc(q.name)} (${fmt(q.f.size)}) <span></span><div class="pb"><div></div></div>`;
-  $("up").appendChild(div);
+  const q = queue.shift();
+  bt.cur = q.name; bt.curLoaded = 0; upDraw();
   const send = ow => {
-    const x = new XMLHttpRequest();
+    const x = xhr = new XMLHttpRequest();
     x.open("PUT", `/api/upload?path=${encodeURIComponent(q.dir)}&name=${encodeURIComponent(q.name)}${ow?"&overwrite=1":""}`);
-    x.upload.onprogress = e => { if(e.lengthComputable){ div.querySelector(".pb div").style.width = (100*e.loaded/e.total) + "%"; div.querySelector("span").textContent = Math.floor(100*e.loaded/e.total) + "%"; } };
+    x.upload.onprogress = e => { if(e.lengthComputable && xhr === x){ bt.curLoaded = q.f.size * e.loaded / e.total; upDraw(); } };
     x.onload = () => {
-      if(x.status === 409 && !ow && admin && confirm(q.name + " уже существует. Заменить?")) return send(true);
-      if(x.status >= 200 && x.status < 300){ div.querySelector("span").textContent = "готово"; setTimeout(() => div.remove(), 3000); }
-      else { if(x.status === 401) setAdmin(false); let m = "HTTP " + x.status; try{ m = JSON.parse(x.responseText).error; }catch(e){} div.querySelector("span").innerHTML = '<span class="err">'+esc(m)+'</span>'; }
-      busy = false; if(q.dir === cur) load(); pump();
+      if(x.status === 409 && !ow && admin && confirm(q.name + " появился на сервере во время загрузки. Заменить?")) return send(true);
+      if(x.status >= 200 && x.status < 300) return upNext(q, "ok");
+      if(x.status === 401) setAdmin(false);
+      let m = "HTTP " + x.status; try{ m = JSON.parse(x.responseText).error; }catch(e){}
+      upNext(q, "err", m);
     };
-    x.onerror = () => { div.querySelector("span").innerHTML = '<span class="err">ошибка сети</span>'; busy = false; pump(); };
+    x.onerror = () => upNext(q, "err", "ошибка сети");
+    x.onabort = () => upNext(q, "skip");
     x.send(q.f);
   };
-  // файл в текущей папке уже есть - спрашиваем до отправки, а не после
-  if(q.dir === cur && !q.name.includes("/") && items.some(i => i.name === q.name)){
-    if(!admin){ div.querySelector("span").innerHTML = '<span class="err">уже существует, замена запрещена</span>'; busy = false; pump(); }
-    else if(confirm(q.name + " уже существует. Заменить?")) send(true);
-    else { div.remove(); busy = false; pump(); }
-  } else send(false);
+  send(q.ow);
 }
 $("bUp").onclick = () => $("fi").click();
 $("bUpD").onclick = () => $("fd").click();
@@ -894,6 +1092,7 @@ addEventListener("drop", async e => {
   else enqueue(e.dataTransfer.files);
 });
 addEventListener("keydown", e => {
+  if($("cmodal").style.display === "flex"){ if(e.key === "Escape") $("cmc").click(); return; }
   if(e.target.tagName === "INPUT" || $("modal").style.display === "flex" || $("lmodal").style.display === "flex"){ if(e.key === "Escape"){ $("modal").style.display = "none"; $("lmodal").style.display = "none"; } return; }
   if(!admin && e.key !== "Backspace") return;
   if(e.key === "Delete" && sel.size) $("bRm").click();
@@ -925,6 +1124,7 @@ body{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:ce
 .ico{width:96px;height:96px;margin:0 auto 18px;border-radius:24px;display:flex;align-items:center;justify-content:center;
  font-size:52px;background:linear-gradient(145deg,#eff6ff,#dbeafe)}
 .name{font-size:20px;font-weight:650;word-break:break-word;line-height:1.3;margin:0 0 8px}
+.cmt{color:#374151;font-size:14.5px;line-height:1.45;margin:6px 0 10px;padding:8px 12px;background:#f9fafb;border-radius:10px;word-break:break-word}
 .size{font-size:28px;font-weight:700;color:#2a6ebb;margin:14px 0 4px}
 .meta{color:#6b7280;font-size:14px;line-height:1.6}
 .dl{display:flex;align-items:center;justify-content:center;gap:10px;margin:24px 0 0;padding:14px 18px;width:100%;
@@ -985,6 +1185,7 @@ const path = location.pathname.replace(/^\/s\/?/, "").split("/").map(decodeURICo
     $("card").innerHTML =
       `<div class="ico">${icon(it)}</div>`+
       `<div class="name">${esc(it.name)}</div>`+
+      (it.comment ? `<div class="cmt">${esc(it.comment)}</div>` : "")+
       `<div class="meta">${it.dir ? "Папка · " + plural(it.files, "файл", "файла", "файлов") + (it.dirs ? ", " + plural(it.dirs, "папка", "папки", "папок") : "") : "Файл"}</div>`+
       `<div class="size">${fmt(it.size)}</div>`+
       `<div class="meta">Изменён ${fdate(it.mtime)}</div>`+
