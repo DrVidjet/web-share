@@ -12,7 +12,9 @@ import html
 import secrets
 import threading
 import json
+import logging
 import os
+import sys
 import shutil
 import stat
 import tarfile
@@ -47,6 +49,20 @@ def load_conf():
 
 
 C = load_conf()
+
+
+def setup_logging(level):
+    """Уровень: ERROR / WARNING / INFO / DEBUG. Вывод - stderr (systemd пишет его в файл лога или журнал);
+    в журнал - без времени, его journald ставит сам."""
+    lvl = logging.getLevelName(str(level).strip().upper())
+    fmt = "%(levelname)s %(message)s" if os.environ.get("JOURNAL_STREAM") else "%(asctime)s %(levelname)s %(message)s"
+    logging.basicConfig(level=lvl if isinstance(lvl, int) else logging.INFO, format=fmt, datefmt="%Y-%m-%d %H:%M:%S")
+    if not isinstance(lvl, int):
+        logging.warning("SHARE_LOG_LEVEL=%s - нет такого уровня (ERROR/WARNING/INFO/DEBUG), взят INFO", level)
+
+
+setup_logging(C.get("SHARE_LOG_LEVEL", "INFO"))
+log = logging.getLogger("share-web")
 ROOT = os.path.realpath(C.get("SHARE_ROOT", "/srv/share"))
 BIND = C.get("SHARE_BIND", "0.0.0.0")
 PORT = int(C.get("SHARE_PORT", "8081"))
@@ -70,7 +86,7 @@ if UPLOAD_USER and UPLOAD_PASS:
 if ADMIN_USER and ADMIN_PASS:
     USERS[ADMIN_USER] = (ADMIN_PASS, "admin")
 SESSION_TTL = int(float(C.get("SHARE_SESSION_HOURS", "12")) * 3600)
-SESSIONS = {}  # токен -> [время истечения, роль]
+SESSIONS = {}  # токен -> [время истечения, роль, логин]
 SLOCK = threading.Lock()
 ARCH_LIMIT = 20000
 # комментарии к файлам/папкам: {путь от корня: текст}. По умолчанию - StateDirectory службы (/var/lib/<служба>)
@@ -88,7 +104,7 @@ def comments_load():
     except FileNotFoundError:
         return {}
     except (OSError, ValueError) as e:
-        print("web-share: не прочитать %s: %s" % (COMMENTS_FILE, e), flush=True)
+        log.warning("комментарии не прочитать (%s): %s", COMMENTS_FILE, e)
         return {}
 
 
@@ -255,7 +271,14 @@ class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *a):
-        pass
+        log.debug("%s %s", self.client_address[0], fmt % a)
+
+    def who(self):
+        """«ip логин» для лога действий."""
+        t = self.token()
+        with SLOCK:
+            s = SESSIONS.get(t) if t else None
+        return "%s %s" % (self.client_address[0], s[2] if s else "гость")
 
     # ---------- helpers ----------
     def allowed(self):
@@ -315,6 +338,7 @@ class H(BaseHTTPRequestHandler):
             if hmac.compare_digest(user.encode(), u.encode()) & hmac.compare_digest(pw.encode(), p.encode()):
                 ok, role = True, r
         if not ok:
+            log.warning("%s: неудачный вход, логин «%s»", self.client_address[0], user[:64])
             time.sleep(1)
             raise Err(403, "Неверный логин или пароль")
         t = secrets.token_urlsafe(32)
@@ -322,11 +346,13 @@ class H(BaseHTTPRequestHandler):
         with SLOCK:
             for k in [k for k, v in SESSIONS.items() if v[0] < now]:
                 del SESSIONS[k]
-            SESSIONS[t] = [now + SESSION_TTL, role]
+            SESSIONS[t] = [now + SESSION_TTL, role, user]
+        log.info("%s: вход %s (%s)", self.client_address[0], user, role)
         self.send_json({"ok": True, "admin": role == "admin", "role": role},
                        cookie="sw_sess=%s; Path=/; HttpOnly; SameSite=Strict" % t)
 
     def logout(self):
+        log.info("[%s] выход", self.who())
         with SLOCK:
             SESSIONS.pop(self.token(), None)
         self.send_json({"ok": True, "admin": False},
@@ -369,6 +395,15 @@ class H(BaseHTTPRequestHandler):
             code, msg = 404, "Не найдено: %s" % e
         else:
             code, msg = 500, "%s: %s" % (type(e).__name__, e)
+        route = urllib.parse.urlsplit(self.path).path
+        if route == "/api/login" and code == 403:
+            pass  # неудачный вход уже записан в login()
+        elif code >= 500:
+            log.error("[%s] %s %s: %s", self.who(), self.command, route, msg, exc_info=e)
+        elif code in (401, 403):
+            log.warning("[%s] %s %s: отказ %d: %s", self.who(), self.command, route, code, msg)
+        else:
+            log.info("[%s] %s %s: %d: %s", self.who(), self.command, route, code, msg)
         # тело запроса (загрузка) могло остаться непрочитанным - соединение не переиспользуем
         self.close_connection = True
         try:
@@ -377,9 +412,13 @@ class H(BaseHTTPRequestHandler):
             pass
 
     # ---------- routing ----------
+    def deny(self):
+        log.warning("%s: адрес не из SHARE_ALLOW, %s %s - 403", self.client_address[0], self.command, self.path[:200])
+        self.send_error(403)
+
     def do_GET(self):
         if not self.allowed():
-            return self.send_error(403)
+            return self.deny()
         route = urllib.parse.urlsplit(self.path).path
         try:
             if route == "/":
@@ -413,27 +452,27 @@ class H(BaseHTTPRequestHandler):
                 self.archive_get()
             else:
                 self.send_error(404)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except (BrokenPipeError, ConnectionResetError) as e:
+            log.debug("%s: соединение оборвано: %s", self.client_address[0], e)
         except Exception as e:
             self.handle_err(e)
 
     def do_PUT(self):
         if not self.allowed():
-            return self.send_error(403)
+            return self.deny()
         try:
             if urllib.parse.urlsplit(self.path).path == "/api/upload":
                 self.upload()
             else:
                 self.send_error(404)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except (BrokenPipeError, ConnectionResetError) as e:
+            log.debug("%s: соединение оборвано: %s", self.client_address[0], e)
         except Exception as e:
             self.handle_err(e)
 
     def do_POST(self):
         if not self.allowed():
-            return self.send_error(403)
+            return self.deny()
         route = urllib.parse.urlsplit(self.path).path
         try:
             d = self.body_json()
@@ -450,6 +489,7 @@ class H(BaseHTTPRequestHandler):
                 self.need_write(parent)
                 p = os.path.join(parent, check_name(d.get("name", "").strip()))
                 os.mkdir(p)
+                log.info("[%s] создана папка %s", self.who(), relpath(p))
                 self.send_json({"ok": True})
             elif route == "/api/rename":
                 src = resolve(d.get("path"))
@@ -459,6 +499,7 @@ class H(BaseHTTPRequestHandler):
                 if os.path.lexists(dst):
                     raise Err(409, "Уже существует: " + os.path.basename(dst))
                 os.rename(src, dst)
+                log.info("[%s] переименовано: %s -> %s", self.who(), relpath(src), os.path.basename(dst))
                 comments_move(relpath(src), relpath(dst))
                 self.send_json({"ok": True})
             elif route == "/api/delete":
@@ -468,8 +509,10 @@ class H(BaseHTTPRequestHandler):
                         raise Err(400, "Нельзя удалить корень")
                     if os.path.isdir(p) and not os.path.islink(p):
                         shutil.rmtree(p)
+                        log.info("[%s] удалена папка %s", self.who(), relpath(p))
                     else:
                         os.remove(p)
+                        log.info("[%s] удалён %s", self.who(), relpath(p))
                     comments_drop(relpath(p))
                 self.send_json({"ok": True})
             elif route == "/api/paste":
@@ -485,11 +528,12 @@ class H(BaseHTTPRequestHandler):
                     else:
                         COMMENTS.pop(relpath(p), None)
                     comments_save()
+                log.info("[%s] комментарий к %s: «%s»", self.who(), relpath(p), text)
                 self.send_json({"ok": True, "text": text})
             else:
                 self.send_error(404)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        except (BrokenPipeError, ConnectionResetError) as e:
+            log.debug("%s: соединение оборвано: %s", self.client_address[0], e)
         except Exception as e:
             self.handle_err(e)
 
@@ -533,6 +577,7 @@ class H(BaseHTTPRequestHandler):
     def download(self):
         p = resolve(self.qget("path"))
         if os.path.isdir(p):
+            log.info("[%s] скачивание папки (zip) %s", self.who(), relpath(p) or "/")
             self.send_zip(p)
             return
         size = os.path.getsize(p)
@@ -555,6 +600,9 @@ class H(BaseHTTPRequestHandler):
                 return
             code = 206
         length = end - start + 1 if size else 0
+        # докачка кусками (Range) - одна запись на начало файла, остальные куски - DEBUG
+        log.log(logging.INFO if start == 0 else logging.DEBUG, "[%s] скачивание %s (%d байт%s)", self.who(),
+                relpath(p), size, ", с %d" % start if start else "")
         self.send_response(code)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Disposition", self.disp(os.path.basename(p)))
@@ -604,6 +652,7 @@ class H(BaseHTTPRequestHandler):
         p = resolve(self.qget("path"))
         member = self.qget("member")
         kind = archive_kind(p)
+        log.info("[%s] скачивание из архива %s: %s", self.who(), relpath(p), member)
         name = os.path.basename(member.rstrip("/")) or "file"
         self.send_response(200)
         self.send_header("Content-Type", "application/octet-stream")
@@ -665,10 +714,12 @@ class H(BaseHTTPRequestHandler):
                         raise Err(400, "Загрузка прервана")
                     f.write(b)
                     left -= len(b)
+            replaced = os.path.lexists(dst)
             if role == "admin":
                 os.replace(tmp, dst)
             else:
                 os.link(tmp, dst)  # не заменит файл, появившийся за время загрузки (FileExistsError)
+            log.info("[%s] загружен %s (%d байт%s)", self.who(), relpath(dst), n, ", заменён" if replaced else "")
         finally:
             if os.path.exists(tmp):
                 os.remove(tmp)
@@ -692,6 +743,7 @@ class H(BaseHTTPRequestHandler):
                 if os.path.lexists(dst):
                     raise Err(409, "В папке назначения уже есть: " + os.path.basename(src))
                 shutil.move(src, dst)
+                log.info("[%s] перемещено: %s -> %s", self.who(), relpath(src), relpath(dst))
                 comments_move(relpath(src), relpath(dst))
             elif op == "copy":
                 dst = unique_dest(dest, os.path.basename(src))
@@ -699,6 +751,7 @@ class H(BaseHTTPRequestHandler):
                     shutil.copytree(src, dst, symlinks=True)
                 else:
                     shutil.copy2(src, dst, follow_symlinks=False)
+                log.info("[%s] скопировано: %s -> %s", self.who(), relpath(src), relpath(dst))
                 comments_move(relpath(src), relpath(dst), copy=True)
             else:
                 raise Err(400, "Неизвестная операция")
@@ -1207,11 +1260,23 @@ PAGE = PAGE.replace("%%TITLE%%", _e(TITLE)).replace("%%SMB%%", _e(" · ".join(SM
 SHARE_PAGE = SHARE_PAGE.replace("%%FOOT%%", _e("Общая папка · " + (SMB_PATHS[0] if SMB_PATHS else TITLE)))
 
 
+class Server(ThreadingHTTPServer):
+    def handle_error(self, request, client_address):
+        # обрыв соединения клиентом (закрыл вкладку, отменил скачивание) - не ошибка
+        ex = sys.exc_info()[1]
+        if isinstance(ex, (ConnectionResetError, BrokenPipeError, TimeoutError)):
+            log.debug("%s: соединение оборвано: %s", client_address[0], ex)
+        else:
+            log.exception("%s: ошибка при обработке запроса", client_address[0])
+
+
 if __name__ == "__main__":
     os.umask(0o002)
+    log.info("запуск: %s:%d, папка %s, пользователи: %s, уровень лога %s", BIND, PORT, ROOT,
+             ", ".join("%s (%s)" % (u, r) for u, (_, r) in USERS.items()) or "нет",
+             logging.getLevelName(logging.getLogger().level))
     if not USERS:
-        print("web-share: не задан ни один пользователь (SHARE_PASS / SHARE_UPLOAD_PASS) - только просмотр и скачивание",
-              flush=True)
-    srv = ThreadingHTTPServer((BIND, PORT), H)
+        log.warning("не задан ни один пользователь (SHARE_PASS / SHARE_UPLOAD_PASS) - только просмотр и скачивание")
+    srv = Server((BIND, PORT), H)
     srv.daemon_threads = True
     srv.serve_forever()

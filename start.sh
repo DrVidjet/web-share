@@ -146,17 +146,18 @@ SERVICE=$INSTALL_SERVICE
 UNIT=/etc/systemd/system/$SERVICE.service
 CRON=/etc/cron.d/$SERVICE-images-index
 SMBINC=/etc/samba/$SERVICE.conf
+LOGROT=/etc/logrotate.d/$SERVICE
 
 if [ "$UNINSTALL" = 1 ]; then
   say "Удаление $SERVICE"
   systemctl disable --now "$SERVICE" 2>/dev/null || true
-  rm -f "$UNIT" "$CRON"
+  rm -f "$UNIT" "$CRON" "$LOGROT"
   if [ -f "$SMBINC" ]; then
     rm -f "$SMBINC"; sed -i "\|^[[:space:]]*include = $SMBINC\$|d" /etc/samba/smb.conf
     systemctl reload smbd 2>/dev/null || true
   fi
   systemctl daemon-reload
-  ask_yn DEL_DIR "Удалить папку установки $INSTALL_DIR (код, venv, .env)?" y
+  ask_yn DEL_DIR "Удалить папку установки $INSTALL_DIR (код, venv, .env, логи)?" y
   [ "$DEL_DIR" = y ] && rm -rf "$INSTALL_DIR"
   if [ -d "/var/lib/$SERVICE" ]; then
     ask_yn DEL_STATE "Удалить комментарии к файлам (/var/lib/$SERVICE)?" y
@@ -197,11 +198,19 @@ ask SHARE_SMB_PATHS "Пути Samba для показа в шапке (чере�
 
 setting SHARE_SESSION_HOURS 12
 setting SHARE_COMMENTS_FILE ""
+setting SHARE_LOG_LEVEL INFO
+SHARE_LOG_LEVEL=${SHARE_LOG_LEVEL^^}
+case $SHARE_LOG_LEVEL in ERROR|WARNING|INFO|DEBUG) ;; *) warn "SHARE_LOG_LEVEL=$SHARE_LOG_LEVEL - нет такого уровня, будет INFO"; SHARE_LOG_LEVEL=INFO ;; esac
 setting INSTALL_SMB_WORM_GRACE 30
+# логи: папка (по умолчанию <папка установки>/log) или journal - только журнал systemd
+setting INSTALL_LOG_DIR "$INSTALL_DIR/log"
+INSTALL_LOG_DIR=${INSTALL_LOG_DIR%/}
+[ -z "$INSTALL_LOG_DIR" ] && INSTALL_LOG_DIR=journal
 RUN_USER=$INSTALL_RUN_USER
 # ---------------------------------------------------------------- установка
 need_pkgs python3 python3-venv ca-certificates
 [ -n "$INSTALL_DOCKER_INDEX_DIR" ] && need_pkgs cron
+[ "$INSTALL_LOG_DIR" != journal ] && need_pkgs logrotate
 [ "$INSTALL_SAMBA" = y ] && need_pkgs samba
 
 say "Пользователь $RUN_USER и общая папка $SHARE_ROOT"
@@ -234,14 +243,42 @@ umask 077
 {
   echo "# $APP: настройки (создано start.sh $(date '+%F %T')). После правки: systemctl restart $SERVICE"
   for k in SHARE_ROOT SHARE_PORT SHARE_BIND SHARE_ALLOW SHARE_TITLE SHARE_SMB_PATHS SHARE_USER SHARE_PASS \
-           SHARE_UPLOAD_USER SHARE_UPLOAD_PASS SHARE_UPLOAD_DIR SHARE_SESSION_HOURS SHARE_COMMENTS_FILE; do echo "$k=${!k}"; done
+           SHARE_UPLOAD_USER SHARE_UPLOAD_PASS SHARE_UPLOAD_DIR SHARE_SESSION_HOURS SHARE_COMMENTS_FILE SHARE_LOG_LEVEL; do echo "$k=${!k}"; done
   echo "# для start.sh (приложение не читает)"
-  for k in INSTALL_SERVICE INSTALL_RUN_USER INSTALL_DOCKER_INDEX_DIR INSTALL_SAMBA INSTALL_SMB_NAME INSTALL_SMB_WORM_GRACE; do echo "$k=${!k-}"; done
+  for k in INSTALL_SERVICE INSTALL_RUN_USER INSTALL_DOCKER_INDEX_DIR INSTALL_SAMBA INSTALL_SMB_NAME INSTALL_SMB_WORM_GRACE \
+           INSTALL_LOG_DIR; do echo "$k=${!k-}"; done
 } > "$cfg.tmp"
 umask 022
 chown "root:$RUN_GROUP" "$cfg.tmp"; chmod 640 "$cfg.tmp"; mv "$cfg.tmp" "$cfg"
 rm -f "$INSTALL_DIR/config.env"
 echo "настройки: $cfg"
+
+# логи: вывод службы и индекса docker-образов - в файлы $INSTALL_LOG_DIR, ротация - logrotate (copytruncate)
+LOG_UNIT=""; CRON_LOG=""
+if [ "$INSTALL_LOG_DIR" != journal ]; then
+  # группа службы может писать в папку: cron индекса работает от $RUN_USER и сам создаёт свой файл
+  install -d -o root -g "$RUN_GROUP" -m 775 "$INSTALL_LOG_DIR"
+  LOG_UNIT=$(printf 'Environment=PYTHONUNBUFFERED=1\nStandardOutput=append:%s/%s.log\nStandardError=inherit' "$INSTALL_LOG_DIR" "$SERVICE")
+  [ -n "$INSTALL_DOCKER_INDEX_DIR" ] && CRON_LOG=" >> $INSTALL_LOG_DIR/$SERVICE-images-index.log 2>&1"
+  cat > "$LOGROT" <<ROT_END
+# $APP (создано start.sh)
+$INSTALL_LOG_DIR/*.log {
+    weekly
+    maxsize 20M
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root $RUN_GROUP
+}
+ROT_END
+  chmod 644 "$LOGROT"
+  echo "логи: $INSTALL_LOG_DIR (ротация - $LOGROT)"
+else
+  rm -f "$LOGROT"
+fi
 
 say "Служба $SERVICE"
 cat > "$UNIT" <<EOF
@@ -263,6 +300,7 @@ StateDirectory=$SERVICE
 StateDirectoryMode=0750
 Restart=on-failure
 RestartSec=5
+$LOG_UNIT
 
 [Install]
 WantedBy=multi-user.target
@@ -272,7 +310,7 @@ systemctl enable "$SERVICE" >/dev/null 2>&1
 systemctl restart "$SERVICE"
 
 if [ -n "$INSTALL_DOCKER_INDEX_DIR" ]; then
-  echo "*/5 * * * * $RUN_USER $INSTALL_DIR/share-images-index.sh $INSTALL_DOCKER_INDEX_DIR" > "$CRON"
+  echo "*/5 * * * * $RUN_USER $INSTALL_DIR/share-images-index.sh $INSTALL_DOCKER_INDEX_DIR$CRON_LOG" > "$CRON"
   chmod 644 "$CRON"
   systemctl enable --now cron >/dev/null 2>&1 || true
   echo "cron: $CRON (индекс $INSTALL_DOCKER_INDEX_DIR/images.list раз в 5 минут)"
@@ -361,4 +399,8 @@ echo "Адреса:"
 for a in $(host_ips); do echo "  http://$a:$SHARE_PORT/"; done
 echo "Полный доступ:   $SHARE_USER / $SHARE_PASS"
 [ -n "$SHARE_UPLOAD_USER" ] && echo "Только загрузка: $SHARE_UPLOAD_USER / $SHARE_UPLOAD_PASS (в /$SHARE_UPLOAD_DIR)"
-echo "Настройки: $cfg   Логи: journalctl -u $SERVICE"
+if [ "$INSTALL_LOG_DIR" != journal ]; then
+  echo "Настройки: $cfg   Логи: $INSTALL_LOG_DIR/"
+else
+  echo "Настройки: $cfg   Логи: journalctl -u $SERVICE"
+fi
