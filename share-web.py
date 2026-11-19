@@ -21,7 +21,10 @@ import tarfile
 import time
 import urllib.parse
 import zipfile
+import zlib
 import gzip
+import hashlib
+import struct
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
@@ -90,8 +93,8 @@ SESSIONS = {}  # токен -> [время истечения, роль, лог�
 SLOCK = threading.Lock()
 ARCH_LIMIT = 20000
 # комментарии к файлам/папкам: {путь от корня: текст}. По умолчанию - StateDirectory службы (/var/lib/<служба>)
-COMMENTS_FILE = C.get("SHARE_COMMENTS_FILE") or os.path.join(
-    os.environ.get("STATE_DIRECTORY", "").split(":")[0] or os.path.dirname(os.path.realpath(__file__)), "comments.json")
+STATE_DIR = os.environ.get("STATE_DIRECTORY", "").split(":")[0] or os.path.dirname(os.path.realpath(__file__))
+COMMENTS_FILE = C.get("SHARE_COMMENTS_FILE") or os.path.join(STATE_DIR, "comments.json")
 COMMENT_MAX = 1000
 CLOCK = threading.Lock()
 
@@ -214,6 +217,294 @@ def dir_size(path):
         except OSError:
             pass
     return total
+
+
+def hsize(n):
+    for u in ("байт", "КБ", "МБ", "ГБ"):
+        if n < 1024 or u == "ГБ":
+            return ("%d %s" if u == "байт" else "%.1f %s") % (n, u)
+        n /= 1024.0
+
+
+# ---------- папка -> zip: размер известен заранее, докачка (Range) ----------
+# CRC файлов, уже отданных в zip: ключ "dev:ino:размер:mtime_ns" -> crc32. Нужен, чтобы при докачке с середины
+# не перечитывать с диска всё, что было до места обрыва (CRC пишутся после данных и в каталоге в конце).
+CRC_FILE = os.path.join(STATE_DIR, "zip-crc.json")
+CRC_MAX = 100000
+CRC_LOCK = threading.Lock()
+CRC_BUSY = {}  # ключ -> Lock: один файл не считаем в два потока
+ZIP64_LIMIT = (1 << 31) - 1  # как в zipfile: больше - ZIP64
+
+
+def crc_load():
+    try:
+        with open(CRC_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return {str(k): int(v) for k, v in d.items()} if isinstance(d, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        log.warning("кэш CRC для zip не прочитать (%s): %s", CRC_FILE, e)
+        return {}
+
+
+CRC_CACHE = crc_load()
+CRC_DIRTY = [False]
+
+
+def crc_put(key, crc):
+    with CRC_LOCK:
+        CRC_CACHE.pop(key, None)
+        CRC_CACHE[key] = crc
+        while len(CRC_CACHE) > CRC_MAX:
+            del CRC_CACHE[next(iter(CRC_CACHE))]
+        CRC_DIRTY[0] = True
+
+
+def crc_save():
+    with CRC_LOCK:
+        if not CRC_DIRTY[0]:
+            return
+        CRC_DIRTY[0] = False
+        tmp = CRC_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(CRC_CACHE, f)
+            os.replace(tmp, CRC_FILE)
+        except OSError as e:
+            log.warning("кэш CRC для zip не сохранить (%s): %s", CRC_FILE, e)
+
+
+def read_exact(f, n, e):
+    """n байт файла; если файл укоротился (или не открылся) - добиваем нулями, чтобы не сбить разметку zip."""
+    b = f.read(n) if f else b""
+    if len(b) < n:
+        if not e.get("warned"):
+            e["warned"] = True
+            log.warning("zip: файл %s изменился или не читается во время отдачи - в архиве будет испорчен",
+                        e["path"])
+        b += b"\0" * (n - len(b))
+    return b
+
+
+def open_or_none(e):
+    try:
+        return open(e["path"], "rb")
+    except OSError as ex:
+        if not e.get("warned"):
+            e["warned"] = True
+            log.warning("zip: %s не открыть: %s", e["path"], ex)
+        return None
+
+
+def crc_file(e, stop=None):
+    """CRC файла (из кэша или прочитав его целиком). None - прервано через stop."""
+    key = e["key"]
+    with CRC_LOCK:
+        if key in CRC_CACHE:
+            return CRC_CACHE[key]
+        lk = CRC_BUSY.setdefault(key, threading.Lock())
+    with lk:
+        with CRC_LOCK:
+            if key in CRC_CACHE:
+                return CRC_CACHE[key]
+        c, left = 0, e["size"]
+        f = open_or_none(e)
+        try:
+            while left > 0:
+                if stop is not None and stop.is_set():
+                    return None
+                b = read_exact(f, min(CHUNK, left), e)
+                c = zlib.crc32(b, c)
+                left -= len(b)
+        finally:
+            if f:
+                f.close()
+        crc_put(key, c)
+    with CRC_LOCK:
+        CRC_BUSY.pop(key, None)
+    return c
+
+
+def dos_time(mtime):
+    t = time.localtime(mtime)
+    if t.tm_year < 1980:
+        return 0, (1 << 5) | 1
+    if t.tm_year > 2107:
+        return (23 << 11) | (59 << 5) | 29, (127 << 9) | (12 << 5) | 31
+    return (t.tm_hour << 11) | (t.tm_min << 5) | (t.tm_sec // 2), ((t.tm_year - 1980) << 9) | (t.tm_mon << 5) | t.tm_mday
+
+
+class ZipPlan:
+    """Папка -> zip без сжатия (ISO/архивы всё равно не жмутся), разложенный заранее: размер известен до отдачи,
+    любой кусок (Range) при докачке собирается заново байт в байт, пока файлы в папке не менялись (ETag).
+    CRC - в дескрипторе после данных (флаг 0x08, как пишет zipfile в поток) и в центральном каталоге,
+    поэтому заголовки перед данными от CRC не зависят. ZIP64 - для файлов > 2 ГБ и всего, что дальше 2 ГБ от начала."""
+
+    def __init__(self, p):
+        base = os.path.basename(p) or "share"
+        self.ents = []
+        for d, dirs, files in os.walk(p):
+            dirs.sort()
+            arc = (base + "/" + os.path.relpath(d, p).replace(os.sep, "/")) if d != p else base
+            if not files and not dirs:
+                try:
+                    st = os.stat(d)
+                except OSError:
+                    continue
+                self.add(arc + "/", None, st, True)
+            for f in sorted(files):
+                fp = os.path.join(d, f)
+                try:
+                    st = os.stat(fp)  # ссылки раскрываются, как раньше
+                except OSError:
+                    continue  # битые ссылки
+                if stat.S_ISREG(st.st_mode) and os.access(fp, os.R_OK):  # сокеты, нечитаемое - мимо
+                    self.add(arc + "/" + f, fp, st, False)
+        # разметка: [локальный заголовок, данные, дескриптор]..., центральный каталог + концовка
+        self.parts = []
+        off = 0
+        h = hashlib.sha1()
+        for e in self.ents:
+            e["off"] = off
+            # ZIP64 и по смещению: unzip (Info-ZIP) по ZIP64-записи в каталоге ждёт 24-байтный дескриптор,
+            # иначе - «overlapped components (possible zip bomb)»
+            e["zip64"] = not e["dir"] and (e["size"] > ZIP64_LIMIT or off > ZIP64_LIMIT)
+            lh = self.local(e)
+            self.parts.append((off, len(lh), "b", lh))
+            off += len(lh)
+            if not e["dir"]:
+                self.parts.append((off, e["size"], "f", e))
+                off += e["size"]
+                n = 24 if e["zip64"] else 16
+                self.parts.append((off, n, "d", e))
+                off += n
+            h.update(e["name"] + b"\0" + e["key"].encode() + b"\0")
+        self.cd_off = off
+        self.cd_len = len(self.central(lambda e: 0))
+        self.parts.append((off, self.cd_len, "c", None))
+        self.size = off + self.cd_len
+        self.files = sum(1 for e in self.ents if not e["dir"])
+        self.etag = '"z%s-%x"' % (h.hexdigest()[:20], self.size)
+        self.cd = None
+
+    def add(self, name, path, st, isdir):
+        tm, dt = dos_time(st.st_mtime)
+        size = 0 if isdir else st.st_size
+        self.ents.append({
+            "name": name.encode("utf-8", "surrogateescape"), "path": path, "dir": isdir, "size": size,
+            "tm": tm, "dt": dt,
+            "attr": ((0o40000 | (st.st_mode & 0o7777)) << 16 | 0x10) if isdir else (st.st_mode & 0xFFFF) << 16,
+            "key": "%d:%d:%d:%d" % (st.st_dev, st.st_ino, size, st.st_mtime_ns)})
+
+    @staticmethod
+    def flags(e):
+        return (0 if e["dir"] else 0x08) | (0 if e["name"].isascii() else 0x800)
+
+    def local(self, e):
+        extra = struct.pack("<HHQQ", 1, 16, 0, 0) if e["zip64"] else b""
+        sz = 0xFFFFFFFF if e["zip64"] else 0
+        return struct.pack("<4s2B4HL2L2H", b"PK\003\004", 45 if e["zip64"] else 20, 0, self.flags(e), 0,
+                           e["tm"], e["dt"], 0, sz, sz, len(e["name"]), len(extra)) + e["name"] + extra
+
+    @staticmethod
+    def descriptor(e, crc):
+        return struct.pack("<LLQQ" if e["zip64"] else "<LLLL", 0x08074b50, crc, e["size"], e["size"])
+
+    def central(self, crc_of):
+        out = []
+        for e in self.ents:
+            vals = []
+            size, off = e["size"], e["off"]
+            if size > ZIP64_LIMIT:
+                vals += [size, size]
+                size = 0xFFFFFFFF
+            if off > ZIP64_LIMIT:
+                vals.append(off)
+                off = 0xFFFFFFFF
+            extra = struct.pack("<HH%dQ" % len(vals), 1, 8 * len(vals), *vals) if vals else b""
+            ver = 45 if vals or e["zip64"] else 20
+            crc = 0 if e["dir"] else crc_of(e)
+            out.append(struct.pack("<4s4B4HL2L5HLL", b"PK\001\002", ver, 3, ver, 0, self.flags(e), 0,
+                                   e["tm"], e["dt"], crc, size, size, len(e["name"]), len(extra), 0, 0, 0,
+                                   e["attr"], off) + e["name"] + extra)
+        cd = b"".join(out)
+        n, cd_size, cd_off = len(self.ents), len(cd), self.cd_off
+        if n >= 0xFFFF or cd_size > ZIP64_LIMIT or cd_off > ZIP64_LIMIT:
+            cd += struct.pack("<4sQ2H2L4Q", b"PK\006\006", 44, 45, 45, 0, 0, n, n, cd_size, cd_off)
+            cd += struct.pack("<4sLQL", b"PK\006\007", 0, cd_off + cd_size, 1)
+            n, cd_size, cd_off = min(n, 0xFFFF), min(cd_size, 0xFFFFFFFF), min(cd_off, 0xFFFFFFFF)
+        return cd + struct.pack("<4s4H2LH", b"PK\005\006", 0, 0, n, n, cd_size, cd_off, 0)
+
+    def chunks(self, start, end):
+        """Байты архива [start, end] кусками. CRC файлов, лежащих (хоть частично) до start, считаются в фоне -
+        они понадобятся в дескрипторах и каталоге; файл, отдаваемый с начала, считается на лету."""
+        stop = threading.Event()
+        ahead = [e for e in self.ents if not e["dir"] and e["off"] < start and e["key"] not in CRC_CACHE]
+        if ahead and end >= self.cd_off:
+            threading.Thread(target=lambda: [crc_file(e, stop) for e in ahead if not stop.is_set()],
+                             daemon=True).start()
+        try:
+            for o, n, kind, x in self.parts:
+                if n == 0 or o + n <= start:
+                    continue
+                if o > end:
+                    break
+                a, b = max(start, o) - o, min(end + 1, o + n) - o
+                if kind == "b":
+                    yield x[a:b]
+                elif kind == "f":
+                    for c in self.file_part(x, a, b):
+                        yield c
+                elif kind == "d":
+                    yield self.descriptor(x, crc_file(x))[a:b]
+                else:
+                    if self.cd is None:
+                        self.cd = self.central(crc_file)
+                    yield self.cd[a:b]
+        finally:
+            stop.set()
+            crc_save()
+
+    def file_part(self, e, a, b):
+        track = a == 0 and e["key"] not in CRC_CACHE  # файл с начала - CRC заодно
+        c = 0
+        f = open_or_none(e)
+        try:
+            if f and a:
+                f.seek(a)
+            pos = a
+            while pos < b:
+                d = read_exact(f, min(CHUNK, b - pos), e)
+                if track:
+                    c = zlib.crc32(d, c)
+                pos += len(d)
+                yield d
+        finally:
+            if f:
+                f.close()
+        if track and b == e["size"]:
+            crc_put(e["key"], c)
+
+
+def parse_range(hdr, size):
+    """Заголовок Range (один диапазон) -> (start, end) или None (весь файл); ValueError - вне файла (416)."""
+    if not hdr or not hdr.startswith("bytes=") or size <= 0:
+        return None
+    a, _, b = hdr[6:].split(",")[0].strip().partition("-")
+    try:
+        if a:
+            start, end = int(a), (int(b) if b else size - 1)
+        elif b:
+            start, end = max(0, size - int(b)), size - 1
+        else:
+            return None
+    except ValueError:
+        return None
+    end = min(end, size - 1)
+    if start > end:
+        raise ValueError
+    return start, end
 
 
 def archive_kind(path):
@@ -577,76 +868,90 @@ class H(BaseHTTPRequestHandler):
     def download(self):
         p = resolve(self.qget("path"))
         if os.path.isdir(p):
-            log.info("[%s] скачивание папки (zip) %s", self.who(), relpath(p) or "/")
-            self.send_zip(p)
-            return
+            return self.send_zip(p)
         size = os.path.getsize(p)
-        start, end = 0, size - 1
-        rng = self.headers.get("Range")
-        code = 200
-        if rng and rng.startswith("bytes=") and size > 0:
-            a, _, b = rng[6:].split(",")[0].partition("-")
-            if a:
-                start = int(a)
-                end = int(b) if b else size - 1
-            else:
-                start = max(0, size - int(b))
-            end = min(end, size - 1)
-            if start > end:
-                self.send_response(416)
-                self.send_header("Content-Range", "bytes */%d" % size)
-                self.send_header("Content-Length", "0")
-                self.end_headers()
-                return
-            code = 206
+        try:
+            r = parse_range(self.headers.get("Range"), size)
+        except ValueError:
+            return self.send_416(size)
+        start, end = r or (0, size - 1)
         length = end - start + 1 if size else 0
         # докачка кусками (Range) - одна запись на начало файла, остальные куски - DEBUG
-        log.log(logging.INFO if start == 0 else logging.DEBUG, "[%s] скачивание %s (%d байт%s)", self.who(),
-                relpath(p), size, ", с %d" % start if start else "")
-        self.send_response(code)
+        log.log(logging.INFO if start == 0 else logging.DEBUG, "[%s] скачивание %s (%s%s)", self.who(),
+                relpath(p), hsize(size), ", с %s" % hsize(start) if start else "")
+        self.send_response(206 if r else 200)
         self.send_header("Content-Type", "application/octet-stream")
         self.send_header("Content-Disposition", self.disp(os.path.basename(p)))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
-        if code == 206:
+        if r:
             self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, size))
         self.end_headers()
-        with open(p, "rb") as f:
-            f.seek(start)
-            left = length
-            while left > 0:
-                b = f.read(min(CHUNK, left))
-                if not b:
-                    break
-                self.wfile.write(b)
-                left -= len(b)
+
+        def chunks():
+            with open(p, "rb") as f:
+                f.seek(start)
+                left = length
+                while left > 0:
+                    b = f.read(min(CHUNK, left))
+                    if not b:
+                        break
+                    yield b
+                    left -= len(b)
+        self.pump(chunks(), relpath(p), start, length, size)
+
+    def send_416(self, size):
+        self.send_response(416)
+        self.send_header("Content-Range", "bytes */%d" % size)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
 
     def send_zip(self, p):
-        """Папка -> zip потоком (без сжатия: ISO/архивы всё равно не жмутся, а так быстро; ZIP64 для >4 ГБ)."""
-        base = os.path.basename(p) or "share"
-        self.send_response(200)
+        """Папка -> zip (ZipPlan): Content-Length известен, докачка по Range с проверкой If-Range (ETag)."""
+        plan = ZipPlan(p)
+        rel = relpath(p) or "/"
+        rng = self.headers.get("Range")
+        ifr = self.headers.get("If-Range")
+        if ifr and ifr.strip() != plan.etag:
+            rng = None  # папка изменилась с прошлого раза - отдаём заново целиком
+        try:
+            r = parse_range(rng, plan.size)
+        except ValueError:
+            return self.send_416(plan.size)
+        start, end = r or (0, plan.size - 1)
+        log.info("[%s] скачивание папки (zip) %s (%s, файлов %d%s)", self.who(), rel, hsize(plan.size), plan.files,
+                 ", докачка с %s" % hsize(start) if start else "")
+        self.send_response(206 if r else 200)
         self.send_header("Content-Type", "application/zip")
-        self.send_header("Content-Disposition", self.disp(base + ".zip"))
-        self.send_header("Connection", "close")
+        self.send_header("Content-Disposition", self.disp((os.path.basename(p) or "share") + ".zip"))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("ETag", plan.etag)
+        self.send_header("Content-Length", str(end - start + 1))
+        if r:
+            self.send_header("Content-Range", "bytes %d-%d/%d" % (start, end, plan.size))
         self.end_headers()
-        self.close_connection = True
-        with zipfile.ZipFile(self.wfile, "w", zipfile.ZIP_STORED, allowZip64=True) as z:
-            for d, dirs, files in os.walk(p):
-                dirs.sort()
-                arc = os.path.join(base, os.path.relpath(d, p)) if d != p else base
-                if not files and not dirs:
-                    z.writestr(zipfile.ZipInfo(arc + "/"), b"")
-                for f in sorted(files):
-                    fp = os.path.join(d, f)
-                    if not os.path.isfile(fp):
-                        continue  # битые ссылки, сокеты и т.п.
-                    try:
-                        zi = zipfile.ZipInfo.from_file(fp, os.path.join(arc, f))
-                        zi.compress_type = zipfile.ZIP_STORED
-                        with open(fp, "rb") as src, z.open(zi, "w", force_zip64=zi.file_size > 0x7FFFFFFF) as dst:
-                            shutil.copyfileobj(src, dst, CHUNK)
-                    except OSError:
-                        pass
+        if self.pump(plan.chunks(start, end), rel + " (zip)", start, end - start + 1, plan.size) and end == plan.size - 1:
+            log.info("[%s] папка (zip) %s отдана до конца", self.who(), rel)
+
+    def pump(self, chunks, what, start, length, size):
+        """Отдать куски; обрыв клиентом - в лог (INFO) с тем, сколько успело уйти. True - отдано всё."""
+        sent = 0
+        t0 = time.time()
+        try:
+            for b in chunks:
+                self.wfile.write(b)
+                sent += len(b)
+            return True
+        except (BrokenPipeError, ConnectionResetError, TimeoutError) as e:
+            self.close_connection = True
+            log.info("[%s] скачивание прервано: %s - отдано %s из %s%s за %d с (%s)", self.who(), what,
+                     hsize(sent), hsize(length), ", начиная с %s из %s" % (hsize(start), hsize(size)) if start else "",
+                     time.time() - t0, e.strerror or type(e).__name__)
+            return False
+        finally:
+            close = getattr(chunks, "close", None)
+            if close:
+                close()
 
     def archive_get(self):
         p = resolve(self.qget("path"))

@@ -160,7 +160,7 @@ if [ "$UNINSTALL" = 1 ]; then
   ask_yn DEL_DIR "Удалить папку установки $INSTALL_DIR (код, venv, .env, логи)?" y
   [ "$DEL_DIR" = y ] && rm -rf "$INSTALL_DIR"
   if [ -d "/var/lib/$SERVICE" ]; then
-    ask_yn DEL_STATE "Удалить комментарии к файлам (/var/lib/$SERVICE)?" y
+    ask_yn DEL_STATE "Удалить комментарии к файлам и кэш (/var/lib/$SERVICE)?" y
     [ "$DEL_STATE" = y ] && rm -rf "/var/lib/$SERVICE"
   fi
   echo "Готово. Общая папка ${PRE[SHARE_ROOT]:-} и пользователи не тронуты."
@@ -295,7 +295,7 @@ WorkingDirectory=$INSTALL_DIR
 User=$RUN_USER
 Group=$RUN_GROUP
 UMask=0002
-# /var/lib/$SERVICE - комментарии к файлам (comments.json), если SHARE_COMMENTS_FILE не задан
+# /var/lib/$SERVICE - комментарии к файлам (comments.json), если SHARE_COMMENTS_FILE не задан; кэш CRC для zip (zip-crc.json)
 StateDirectory=$SERVICE
 StateDirectoryMode=0750
 Restart=on-failure
