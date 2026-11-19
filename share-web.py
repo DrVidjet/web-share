@@ -717,8 +717,11 @@ class H(BaseHTTPRequestHandler):
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(b)))
+                self.send_header("Cache-Control", "no-cache")
                 self.end_headers()
                 self.wfile.write(b)
+            elif route == "/api/version":
+                self.send_json({"build": BUILD})
             elif route == "/api/me":
                 r = self.role()
                 self.send_json({"admin": r == "admin", "role": r, "user": ADMIN_USER,
@@ -1181,7 +1184,12 @@ function fdate(t){ if(!t) return ""; const d=new Date(t*1000), p=x=>String(x).pa
 const ARCH = /\.(zip|tar|tgz|tbz2?|txz|gz|bz2|xz|jar)$/i;
 function getClip(){ try{ return JSON.parse(localStorage.shareClip||"null"); }catch(e){ return null; } }
 function setClip(c){ if(c) localStorage.shareClip = JSON.stringify(c); else delete localStorage.shareClip; }
+let inflight = 0;
 async function api(url, body){
+  inflight++;
+  try{ return await api0(url, body); } finally{ inflight--; }
+}
+async function api0(url, body){
   const r = await fetch(url, body === undefined ? {} : {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
   let j = {}; try{ j = await r.json(); }catch(e){}
   if(r.status === 401) setAdmin(false);
@@ -1464,6 +1472,38 @@ addEventListener("keydown", e => {
 addEventListener("storage", updBtns);
 checkMe();
 addEventListener("hashchange", () => { const h = decodeURIComponent(location.hash.slice(1)); if(h !== cur){ cur = h; load(); } });
+// после обновления сервера открытая страница перезагружается сама - когда пользователь ничего не делает
+const BUILD = "%%BUILD%%";
+let newBuild = false;
+const isOpen = id => $(id).style.display === "flex";
+function idle(){
+  return !busy && !queue.length && !inflight && !dragN &&
+    !isOpen("modal") && !isOpen("cmodal") && !isOpen("lmodal") &&
+    !document.querySelector("#tb input:not([type=checkbox])") &&
+    (document.hidden || !sel.size);
+}
+function tryReload(){
+  if(!newBuild || !idle()) return;
+  try{ sessionStorage.swReload = JSON.stringify({sortK, sortD, y: scrollY}); }catch(e){}
+  location.reload();
+}
+async function checkBuild(){
+  if(newBuild) return tryReload();
+  try{
+    const j = await (await fetch("/api/version", {cache: "no-store"})).json();
+    if(j.build && j.build !== BUILD){ newBuild = true; tryReload(); }
+  }catch(e){}
+}
+setInterval(checkBuild, 60000);
+setInterval(tryReload, 3000);
+addEventListener("visibilitychange", () => { if(!document.hidden) checkBuild(); });
+addEventListener("focus", checkBuild);
+try{
+  const r = sessionStorage.swReload && JSON.parse(sessionStorage.swReload);
+  delete sessionStorage.swReload;
+  if(r){ sortK = r.sortK || sortK; sortD = r.sortD || sortD; toast("Страница обновлена до новой версии");
+         const y = r.y; if(y) setTimeout(() => scrollTo(0, y), 300); }
+}catch(e){}
 load();
 </script></body></html>"""
 
@@ -1557,12 +1597,23 @@ const path = location.pathname.replace(/^\/s\/?/, "").split("/").map(decodeURICo
       `<div class="links"><a href="/">Открыть общую папку</a></div>`;
   }
 })();
+// новая версия сервера - перезагрузить карточку
+const BUILD = "%%BUILD%%";
+async function checkBuild(){
+  try{ const j = await (await fetch("/api/version", {cache: "no-store"})).json(); if(j.build && j.build !== BUILD) location.reload(); }catch(e){}
+}
+setInterval(checkBuild, 60000);
+addEventListener("visibilitychange", () => { if(!document.hidden) checkBuild(); });
 </script></body></html>"""
 
 
 _e = html.escape
 PAGE = PAGE.replace("%%TITLE%%", _e(TITLE)).replace("%%SMB%%", _e(" · ".join(SMB_PATHS)))
 SHARE_PAGE = SHARE_PAGE.replace("%%FOOT%%", _e("Общая папка · " + (SMB_PATHS[0] if SMB_PATHS else TITLE)))
+# сборка = хэш страниц: поменялись (новая версия) - открытые вкладки перезагрузятся сами (/api/version)
+BUILD = hashlib.sha1((PAGE + SHARE_PAGE).encode()).hexdigest()[:12]
+PAGE = PAGE.replace("%%BUILD%%", BUILD)
+SHARE_PAGE = SHARE_PAGE.replace("%%BUILD%%", BUILD)
 
 
 class Server(ThreadingHTTPServer):
