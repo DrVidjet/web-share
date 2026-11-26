@@ -268,7 +268,7 @@ docker run --rm -v "$PWD:/src:ro" fedora bash /src/tests/container.sh   # start.
 GitHub Actions (`.github/workflows/ci.yml`, при каждом push/PR и раз в неделю):
 
 - **lint** — `bash -n`, shellcheck, ruff, vermin (совместимость `share-web.py` с Python 3.7);
-- **tests** — `tests/test_web.py` в Ubuntu и Windows на Python 3.8 и 3.13, отдельно на 3.7;
+- **tests** — `tests/test_web.py` в Ubuntu и Windows на Python 3.9 и 3.13, отдельно на 3.7;
 - **distros** — `tests/container.sh` в Debian 10/12/13, Ubuntu 24.04, Fedora, Arch, openSUSE Tumbleweed:
   пакеты, venv, пользователь, unit, cron, logrotate, Samba, запуск, индекс образов, удаление;
 - **linux-systemd** — `install.sh` на раннере с настоящим systemd: служба и smbd запущены, обновление, удаление;

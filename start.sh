@@ -408,7 +408,8 @@ fi
 if [ "$INSTALL_SAMBA" = y ]; then
   say "Samba"
   smb_user() {  # smb_user логин пароль
-    id "$1" >/dev/null 2>&1 || { useradd -r -M -d /nonexistent -s "$NOLOGIN" "$1"; echo "создан системный пользователь $1"; }
+    # без своей группы (-N): группа с тем же именем может уже быть (admin в Ubuntu) - кладём в группу службы
+    id "$1" >/dev/null 2>&1 || { useradd -r -M -N -g "$RUN_GROUP" -d /nonexistent -s "$NOLOGIN" "$1"; echo "создан системный пользователь $1"; }
     printf '%s\n%s\n' "$2" "$2" | smbpasswd -s -a "$1" >/dev/null; smbpasswd -e "$1" >/dev/null
   }
   if [ ! -f /etc/samba/smb.conf ]; then   # Arch: пакет samba без smb.conf

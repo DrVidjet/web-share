@@ -134,7 +134,7 @@ class WebShareTest(unittest.TestCase):
         os.makedirs(os.path.join(share, "docs", "sub"))
         os.makedirs(os.path.join(share, "lost+found"))
         os.makedirs(os.path.join(share, "upload"))
-        with open(os.path.join(share, "lost+found", "secret.txt"), "w") as f:
+        with open(os.path.join(share, "lost+found", "secret.txt"), "w", encoding="utf-8") as f:
             f.write("секрет")
         with open(os.path.join(share, "docs", "a.txt"), "w", encoding="utf-8") as f:
             f.write("привет")

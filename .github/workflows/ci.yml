@@ -22,7 +22,10 @@ jobs:
       - name: shellcheck
         run: shellcheck -x start.sh install.sh share-images-index.sh tests/container.sh
       - name: ruff
-        run: pipx run ruff check --select F,E,W --line-length 120 share-web.py tests/test_web.py
+        run: |
+          # в share-web.py длинные строки - встроенные HTML/JS страницы
+          pipx run ruff check --select F,E,W --ignore E501 share-web.py
+          pipx run ruff check --select F,E,W --line-length 120 tests/test_web.py
       - name: share-web.py совместим с Python 3.7 (Debian 10)
         run: pipx run vermin --target=3.7- --no-tips --violations share-web.py
 
@@ -33,7 +36,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        python: ["3.8", "3.13"]
+        python: ["3.9", "3.13"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
