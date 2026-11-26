@@ -1,15 +1,43 @@
 # web-share — веб-файловый менеджер общей папки
 
+[![CI](https://github.com/DrVidjet/web-share/actions/workflows/ci.yml/badge.svg)](https://github.com/DrVidjet/web-share/actions/workflows/ci.yml)
+
 Это файловый менеджер для одной папки на сервере, работающий в браузере. Можно просматривать файлы, скачивать их
 (папки — одним zip), загружать, делиться ссылками и смотреть архивы. Сервер написан на Python 3 только со
-стандартной библиотекой, HTML/CSS/JS встроены в него. При желании `start.sh` рядом настроит и Samba-шару
-для той же папки.
+стандартной библиотекой, HTML/CSS/JS встроены в него. Работает на **Linux** (служба systemd; при желании
+`start.sh` настроит и Samba-шару для той же папки) и на **Windows** (задача планировщика от SYSTEM).
 
 ![preview](img/preview.png)
 
 ## Быстрый старт
 
-На Debian 10, 11, 12 или 13 (можно на голую систему):
+**Linux** (Debian 10–13, Ubuntu, Astra, Fedora/RHEL, Arch, openSUSE — с systemd, можно на голую систему):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DrVidjet/web-share/HEAD/install.sh | sudo bash
+```
+
+**Windows** 10/11, Server 2016+ — в PowerShell (права администратора запросятся сами):
+
+```powershell
+irm https://raw.githubusercontent.com/DrVidjet/web-share/HEAD/install.ps1 | iex
+```
+
+Обновление — та же команда (ответы возьмутся из прошлой установки). Параметры передаются так:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/DrVidjet/web-share/HEAD/install.sh | sudo bash -s -- -y           # без вопросов
+curl -fsSL https://raw.githubusercontent.com/DrVidjet/web-share/HEAD/install.sh | sudo bash -s -- --uninstall
+```
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/DrVidjet/web-share/HEAD/install.ps1))) -Yes
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/DrVidjet/web-share/HEAD/install.ps1))) -Uninstall
+```
+
+Установщик скачивает проект во временную папку и запускает из него `start.sh` (Linux) или `start.ps1` (Windows),
+дальше всё как при ручной установке ниже.
+
+## Установка на Linux (из клона)
 
 ```bash
 git clone https://github.com/DrVidjet/web-share web-share && cd web-share
@@ -20,13 +48,14 @@ sudo ./start.sh
 Скрипт задаст вопросы: где общая папка, какой порт, логины и пароли, нужна ли Samba и т. д. Значение по умолчанию
 показано в скобках, Enter его принимает, а `-` оставляет поле пустым. Затем скрипт сам:
 
-- поставит недостающие пакеты (`python3`, `python3-venv`, при необходимости `cron`, `samba`). На Debian 10
-  он переключит apt на `archive.debian.org`;
+- поставит недостающие пакеты через apt / dnf / pacman / zypper (`python3` с `venv`, при необходимости `cron`
+  (`cronie`), `logrotate`, `samba`). На Debian 10 он переключит apt на `archive.debian.org`;
 - создаст системного пользователя для службы и общую папку;
 - скопирует программу в папку установки (по умолчанию `/opt/web-share`) и создаст там **виртуальное окружение
   `venv`**: служба запускается только из него;
 - запишет итоговые настройки в `<папка установки>/.env`;
-- создаст и запустит службу systemd, а при необходимости cron и Samba;
+- создаст и запустит службу systemd, а при необходимости cron и Samba; откроет порт в ufw / firewalld, если они
+  включены (для Samba на SELinux включит `samba_export_all_rw`);
 - логи пишет в `<папка установки>/log` (`<служба>.log`, `<служба>-images-index.log`), ротация — logrotate
   (`/etc/logrotate.d/<служба>`, все `*.log` папки: раз в неделю или от 20 МБ, хранит 8, сжимает).
   `INSTALL_LOG_DIR=journal` — только журнал systemd. Уровень — `SHARE_LOG_LEVEL`;
@@ -40,6 +69,38 @@ sudo ./start.sh --uninstall         # убрать службу, cron, logrotate
 
 **Обновление:** взять новую версию (`git pull`) и снова запустить `sudo ./start.sh`. Все ответы по умолчанию
 возьмутся из `.env` прошлой установки, поэтому достаточно нажимать Enter (или запустить с `-y`).
+
+В контейнере без systemd `start.sh` всё поставит и запишет unit, но службу не запустит, а напечатает команду
+ручного запуска.
+
+## Установка на Windows (из клона или zip)
+
+Скачать проект (`git clone` или zip с GitHub) и запустить `start.cmd` (двойным щелчком или из консоли):
+
+```bat
+start.cmd                  :: вопросы, как у start.sh
+start.cmd -Yes             :: без вопросов
+start.cmd -Answers my.env  :: ответы из файла
+start.cmd -Uninstall       :: убрать задачу и правило брандмауэра (общая папка не трогается)
+```
+
+`start.cmd` просто вызывает `start.ps1` (`powershell -ExecutionPolicy Bypass -File start.ps1`). Скрипт:
+
+- попросит права администратора (UAC), если их нет;
+- найдёт Python 3.7+, а если его нет — скачает с python.org и поставит Python 3.12 для всех пользователей
+  (подпись установщика проверяется);
+- скопирует программу в папку установки (по умолчанию `C:\Program Files\web-share`) и создаст там `venv`;
+- запишет настройки в `<папка установки>\.env` (читать могут только SYSTEM и администраторы — там пароли);
+- зарегистрирует задачу планировщика `web-share`: от SYSTEM, при загрузке и раз в 5 минут (если процесс упал —
+  поднимется снова; если работает — повторный запуск пропускается);
+- откроет порт в брандмауэре Windows (правило `web-share-http`);
+- лог — `<папка установки>\log\web-share.log` (ротация в самой программе: 20 МБ, хранится 8);
+- проверит, что страница отвечает, и покажет адреса и пароли.
+
+Общая папка по умолчанию — `C:\Share`, можно и корень диска (`D:\`): служебные `$RECYCLE.BIN` и
+`System Volume Information` в вебе скрыты (`SHARE_HIDE`). Samba и индекс docker-образов — только в Linux;
+в Windows сетевой доступ к папке настраивается штатно (Свойства → Доступ), путь можно показать в шапке
+через `SHARE_SMB_PATHS`. Управление: `Start-ScheduledTask web-share` / `Stop-ScheduledTask web-share`.
 
 ## Возможности
 
@@ -109,16 +170,18 @@ sudo ./start.sh --uninstall         # убрать службу, cron, logrotate
 
 | Ключ | По умолчанию | |
 |---|---|---|
-| `SHARE_ROOT` | `/srv/share` | корень общей папки |
+| `SHARE_ROOT` | `/srv/share` | корень общей папки (точка монтирования данных); `SHARE_UPLOAD_DIR` и `INSTALL_DOCKER_INDEX_DIR` можно задавать относительно него — тогда при переезде шары меняется только эта строка |
 | `SHARE_PORT` | `8081` | порт |
 | `SHARE_BIND` | `0.0.0.0` | адрес, на котором слушать |
 | `SHARE_ALLOW` | `10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8` | с каких сетей пускать (CIDR) |
 | `SHARE_TITLE` | имя папки | название в шапке |
+| `SHARE_HIDE` | `lost+found` | имена в корне общей папки, которых в вебе нет: не показываются, не открываются по ссылке, не попадают в zip (через запятую) |
 | `SHARE_SMB_PATHS` | — | пути Samba через запятую, только для показа в шапке |
 | `SHARE_USER` / `SHARE_PASS` | `admin` / случайный | полный доступ |
 | `SHARE_UPLOAD_USER` / `SHARE_UPLOAD_PASS` | `upload` / случайный | «только загрузка»; пустой логин — выключено |
 | `SHARE_UPLOAD_DIR` | `upload` | папка для «только загрузки», путь от корня |
 | `SHARE_SESSION_HOURS` | `12` | сколько часов живёт вход |
+| `SHARE_LOG_FILE` | — | файл лога с ротацией внутри программы (20 МБ × 8); пусто — stderr. В Windows его задаёт `start.ps1` |
 | `SHARE_LOG_LEVEL` | `INFO` | уровень логов: `ERROR`, `WARNING` (неудачные входы, отказы, ошибки), `INFO` (+ действия: кто с какого адреса вошёл, скачал, загрузил, переименовал, удалил…), `DEBUG` (+ каждый HTTP-запрос) |
 | `INSTALL_LOG_DIR` | `<папка установки>/log` | папка логов; `journal` — только журнал systemd |
 | `INSTALL_*` | | для `start.sh`: папка, служба, пользователь, docker-индекс, Samba (`INSTALL_SMB_WORM_GRACE` — 30 с); программа их не читает |
@@ -170,10 +233,17 @@ sudo ./start.sh --uninstall         # убрать службу, cron, logrotate
 ## Файлы
 
 ```
-start.sh                  установка / обновление / удаление
+install.sh                Linux: установка одной командой (curl | sudo bash) - скачивает проект и запускает start.sh
+start.sh                  Linux: установка / обновление / удаление
+install.ps1               Windows: установка одной командой (irm | iex) - скачивает проект и запускает start.ps1
+start.ps1, start.cmd      Windows: установка / обновление / удаление
 .env.example              все настройки с комментариями (скопировать в .env)
 share-web.py              сервер + страница (PAGE) + страница «поделиться» (SHARE_PAGE)
 share-images-index.sh     индекс docker-образов: share-images-index.sh <папка>
+requirements.txt          зависимостей Python нет - только список системных требований
+tests/test_web.py         тесты HTTP API (Linux и Windows, только stdlib)
+tests/container.sh        проверка start.sh в контейнере дистрибутива
+.github/workflows/ci.yml  CI
 ```
 
 После установки: `<папка установки>/{share-web.py, share-images-index.sh, venv/, .env, log/}`,
@@ -185,9 +255,25 @@ share-images-index.sh     индекс docker-образов: share-images-index
 ```bash
 python3 -m venv .venv
 cp .env.example .env    # и вписать SHARE_ROOT, SHARE_PASS... - программа читает .env рядом с собой
-.venv/bin/python3 -I share-web.py
-# http://127.0.0.1:18081
+.venv/bin/python3 -I share-web.py     # Windows: .venv\Scripts\python.exe -I share-web.py
 ```
+
+## Тесты и CI
+
+```bash
+python3 tests/test_web.py -v                                          # API: настоящий сервер во временной папке
+docker run --rm -v "$PWD:/src:ro" fedora bash /src/tests/container.sh   # start.sh в любом дистрибутиве
+```
+
+GitHub Actions (`.github/workflows/ci.yml`, при каждом push/PR и раз в неделю):
+
+- **lint** — `bash -n`, shellcheck, ruff, vermin (совместимость `share-web.py` с Python 3.7);
+- **tests** — `tests/test_web.py` в Ubuntu и Windows на Python 3.8 и 3.13, отдельно на 3.7;
+- **distros** — `tests/container.sh` в Debian 10/12/13, Ubuntu 24.04, Fedora, Arch, openSUSE Tumbleweed:
+  пакеты, venv, пользователь, unit, cron, logrotate, Samba, запуск, индекс образов, удаление;
+- **linux-systemd** — `install.sh` на раннере с настоящим systemd: служба и smbd запущены, обновление, удаление;
+- **windows** — разбор скриптов в Windows PowerShell 5.1, PSScriptAnalyzer, `install.ps1 -Yes`, вход и
+  загрузка через API, обновление, удаление.
 
 ## API
 
@@ -211,4 +297,4 @@ cp .env.example .env    # и вписать SHARE_ROOT, SHARE_PASS... - прог
 | `POST /api/delete` `{paths: [...]}` | полный | удаление |
 | `POST /api/comment` `{path, text}` | полный | комментарий к файлу/папке (пустой `text` — удалить) |
 
-Требования: Python 3.7+ (Debian 10+), systemd.
+Требования: Python 3.7+ (только stdlib); Linux с systemd или Windows 10/11 / Server 2016+.

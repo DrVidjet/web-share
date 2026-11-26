@@ -1,0 +1,10 @@
+# Пакетов Python не нужно: share-web.py использует только стандартную библиотеку (Python 3.7+).
+# venv создаётся только для того, чтобы служба не зависела от системного python и его пакетов.
+#
+# Системные пакеты (start.sh ставит сам, см. README.md):
+#   python3 + venv (Debian/Ubuntu: python3-venv)   - программа
+#   cron / cronie, findutils, util-linux, tar, gzip - индекс docker-образов (по желанию)
+#   logrotate                                       - ротация логов (если не INSTALL_LOG_DIR=journal)
+#   samba                                           - Samba-шара (по желанию)
+#   systemd                                         - служба
+# Windows: start.ps1 сам поставит Python 3.12 с python.org, если нет Python 3.7+.

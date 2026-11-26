@@ -1,5 +1,6 @@
 #!/bin/bash
-# web-share: установка / обновление / удаление на Debian 10-13.
+# web-share: установка / обновление / удаление на Linux с systemd
+# (Debian 10-13 / Ubuntu / Astra, Fedora / RHEL, Arch, openSUSE). Windows - start.ps1.
 #
 #   sudo ./start.sh                  спросит пути, порт, логины... и запустит службу (systemd + cron)
 #   sudo ./start.sh -y               без вопросов: значения по умолчанию / из прошлой установки / из --answers
@@ -24,7 +25,7 @@ while [ $# -gt 0 ]; do
     -y|--yes) YES=1 ;;
     --answers) ANSWERS=$2; shift ;;
     --uninstall) UNINSTALL=1 ;;
-    -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "неизвестный параметр: $1" >&2; exit 1 ;;
   esac
   shift
@@ -84,17 +85,32 @@ ask_yn() {
 }
 gen_pass() { tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12 || true; }
 
-check_debian() {
-  . /etc/os-release
-  [ "${ID:-}" = debian ] || [[ " ${ID_LIKE:-} " == *" debian "* ]] || die "Нужен Debian (тут: ${PRETTY_NAME:-?})"
-  local dv; dv=$(cut -d. -f1 /etc/debian_version 2>/dev/null)   # у производных (Astra и т.п.) - версия базы Debian
-  case $dv in 10|11|12|13) [ "${ID:-}" = debian ] || echo "${PRETTY_NAME:-?} (база Debian $dv)" ;;
-    *) warn "Проверено на Debian 10-13, тут ${PRETTY_NAME:-?} ($(cat /etc/debian_version 2>/dev/null)) - пробую" ;; esac
+have() { command -v "$1" >/dev/null 2>&1; }
+export PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"   # su без «-» не даёт sbin: useradd, smbd, logrotate
+
+# дистрибутив и пакетный менеджер
+PM=""
+check_os() {
+  # shellcheck disable=SC1091
+  [ -f /etc/os-release ] && . /etc/os-release
+  if have apt-get; then PM=apt
+  elif have dnf; then PM=dnf
+  elif have yum; then PM=yum
+  elif have zypper; then PM=zypper
+  elif have pacman; then PM=pacman
+  else warn "неизвестный пакетный менеджер (${PRETTY_NAME:-?}): нужные программы ставьте сами (см. README)"; fi
+  if [ "$PM" = apt ] && [ -f /etc/debian_version ]; then
+    local dv; dv=$(cut -d. -f1 /etc/debian_version 2>/dev/null)   # у производных (Astra и т.п.) - версия базы Debian
+    case $dv in 10|11|12|13) [ "${ID:-}" = debian ] || echo "${PRETTY_NAME:-?} (база Debian $dv)" ;;
+      *) [ "${ID:-}" = debian ] && warn "Проверено на Debian 10-13, тут ${PRETTY_NAME:-?} - пробую" ;; esac
+  fi
+  [ "$PM" = apt ] || echo "${PRETTY_NAME:-Linux} ($PM)"
 }
-APT_UPDATED=0
+PM_UPDATED=0
 apt_update() {
-  [ "$APT_UPDATED" = 1 ] && return 0
+  [ "$PM_UPDATED" = 1 ] && return 0
   if ! apt-get update -q; then
+    # shellcheck disable=SC1091
     . /etc/os-release
     if [ "${VERSION_CODENAME:-}" = buster ] || [ "${VERSION_CODENAME:-}" = stretch ]; then
       warn "$VERSION_CODENAME больше не на основных зеркалах - переключаю apt на archive.debian.org"
@@ -110,18 +126,58 @@ EOF
       die "apt-get update не прошёл - проверьте сеть и /etc/apt/sources.list"
     fi
   fi
-  APT_UPDATED=1
+  PM_UPDATED=1
 }
-need_pkgs() {
-  local miss=() p
-  for p in "$@"; do
-    dpkg-query -W -f='${Status}' "$p" 2>/dev/null | grep -q 'install ok installed' || miss+=("$p")
-  done
+# есть ли уже то, что даёт логический пакет
+has_feature() {
+  case $1 in
+    python)    have python3 && python3 -c 'import venv, ensurepip' 2>/dev/null ;;
+    certs)     [ -e /etc/ssl/certs/ca-certificates.crt ] || [ -e /etc/pki/tls/certs/ca-bundle.crt ] || [ -d /etc/ssl/certs ] ;;
+    useradd)   have useradd && have runuser ;;
+    tools)     have find && have flock && have tar && have gzip ;;
+    cron)      have crond || have cron ;;
+    logrotate) have logrotate ;;
+    samba)     have smbd && have smbpasswd && have testparm ;;
+    *)         return 1 ;;
+  esac
+}
+# логический пакет -> имена пакетов дистрибутива
+pkg_names() {
+  case $PM:$1 in
+    apt:python) echo python3 python3-venv ;;         *:python) [ "$PM" = pacman ] && echo python || echo python3 ;;
+    *:certs) echo ca-certificates ;;
+    apt:useradd) echo passwd util-linux ;;  pacman:useradd|zypper:useradd) echo shadow util-linux ;;  *:useradd) echo shadow-utils util-linux ;;
+    *:tools) echo findutils util-linux tar gzip ;;
+    apt:cron|zypper:cron) echo cron ;;   *:cron) echo cronie ;;
+    *:logrotate) echo logrotate ;;
+    *:samba) echo samba ;;
+  esac
+}
+# need логический_пакет... - поставить то, чего не хватает
+need() {
+  local f miss=() pk=()
+  for f in "$@"; do has_feature "$f" || miss+=("$f"); done
   [ ${#miss[@]} = 0 ] && return 0
-  say "Ставлю пакеты: ${miss[*]}"
-  apt_update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${miss[@]}"
+  [ -n "$PM" ] || die "не хватает: ${miss[*]} - установите вручную"
+  for f in "${miss[@]}"; do read -ra n <<< "$(pkg_names "$f")"; pk+=("${n[@]}"); done
+  say "Ставлю пакеты: ${pk[*]}"
+  case $PM in
+    apt)    apt_update; DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "${pk[@]}" ;;
+    dnf)    dnf install -y -q "${pk[@]}" ;;
+    yum)    yum install -y -q "${pk[@]}" ;;
+    zypper) zypper -n -q install "${pk[@]}" ;;
+    pacman) if [ "$PM_UPDATED" = 0 ]; then pacman -Sy --noconfirm >/dev/null; PM_UPDATED=1; fi
+            pacman -S --noconfirm --needed "${pk[@]}" ;;
+  esac
+  for f in "${miss[@]}"; do has_feature "$f" || die "после установки пакетов всё ещё нет: $f"; done
 }
+# apt: пакет есть в репозитории - поставить (samba-vfs-modules есть не везде)
+apt_optional() { [ "$PM" = apt ] && apt-cache show "$1" >/dev/null 2>&1 && { apt_update; DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-install-recommends "$1"; }; }
+SYSTEMD=0
+[ -d /run/systemd/system ] && SYSTEMD=1   # в контейнере без systemd служба только записывается
+sctl() { [ "$SYSTEMD" = 1 ] || return 0; systemctl "$@"; }
+# первая существующая служба из списка: unit_of smbd smb -> smbd
+unit_of() { local u; for u in "$@"; do [ -n "$(systemctl list-unit-files "$u.service" --no-legend 2>/dev/null)" ] && { echo "$u"; return; }; done; echo "$1"; }
 make_venv() {   # make_venv папка
   local v=$1/venv
   if [ -x "$v/bin/python3" ] && "$v/bin/python3" -c 'import sys' 2>/dev/null; then return 0; fi
@@ -129,11 +185,25 @@ make_venv() {   # make_venv папка
   python3 -m venv "$v" || die "не удалось создать venv в $v"
   echo "создано виртуальное окружение $v ($("$v/bin/python3" -V 2>&1))"
 }
-host_ips() { ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1; }
+host_ips() {
+  if have ip; then ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1
+  else hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9.]+$' || true; fi
+}
+worm_so() { find /usr/lib /usr/lib64 -path '*samba/vfs/worm.so' 2>/dev/null | grep -q .; }
+# открыть порт в ufw / firewalld, если они включены
+open_port() {  # open_port 8081/tcp [имя службы firewalld]
+  if have ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow "$1" >/dev/null && echo "ufw: открыт $1"
+  elif have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    if [ -n "${2:-}" ]; then firewall-cmd -q --permanent --add-service="$2"; else firewall-cmd -q --permanent --add-port="$1"; fi
+    firewall-cmd -q --reload && echo "firewalld: открыт ${2:-$1}"
+  fi
+  return 0
+}
 set_shebang() { sed -i "1s|.*|#!$2 -I|" "$1"; }  # set_shebang файл python
 
 # ---------------------------------------------------------------- ответы
-check_debian
+check_os
 [ -n "$ANSWERS" ] && { [ -f "$ANSWERS" ] || die "нет файла $ANSWERS"; read_kv "$ANSWERS"; }
 
 echo "${c_b}web-share — веб-файловый менеджер общей папки${c_0}"
@@ -150,13 +220,13 @@ LOGROT=/etc/logrotate.d/$SERVICE
 
 if [ "$UNINSTALL" = 1 ]; then
   say "Удаление $SERVICE"
-  systemctl disable --now "$SERVICE" 2>/dev/null || true
+  sctl disable --now "$SERVICE" 2>/dev/null || true
   rm -f "$UNIT" "$CRON" "$LOGROT"
   if [ -f "$SMBINC" ]; then
     rm -f "$SMBINC"; sed -i "\|^[[:space:]]*include = $SMBINC\$|d" /etc/samba/smb.conf
-    systemctl reload smbd 2>/dev/null || true
+    sctl reload "$(unit_of smbd smb)" 2>/dev/null || true
   fi
-  systemctl daemon-reload
+  sctl daemon-reload || true
   ask_yn DEL_DIR "Удалить папку установки $INSTALL_DIR (код, venv, .env, логи)?" y
   [ "$DEL_DIR" = y ] && rm -rf "$INSTALL_DIR"
   if [ -d "/var/lib/$SERVICE" ]; then
@@ -170,6 +240,7 @@ fi
 ask SHARE_ROOT "Общая папка (корень)" "/srv/share"
 SHARE_ROOT=${SHARE_ROOT%/}
 ask SHARE_PORT "Порт веб-интерфейса" "8081"
+# shellcheck disable=SC2153  # SHARE_PORT задаёт ask
 [[ $SHARE_PORT =~ ^[0-9]+$ ]] && [ "$SHARE_PORT" -ge 1 ] && [ "$SHARE_PORT" -le 65535 ] || die "плохой порт: $SHARE_PORT"
 ask SHARE_BIND "Адрес, на котором слушать (0.0.0.0 — все)" "0.0.0.0"
 ask SHARE_ALLOW "С каких сетей пускать (CIDR через запятую)" "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8"
@@ -185,7 +256,13 @@ if [ -n "$SHARE_UPLOAD_USER" ]; then
 else
   SHARE_UPLOAD_PASS=""; SHARE_UPLOAD_DIR=""
 fi
-ask INSTALL_DOCKER_INDEX_DIR "Папка с docker-образами для индекса images.list (пусто — не нужно)" ""
+ask INSTALL_DOCKER_INDEX_DIR "Папка с docker-образами для индекса images.list, от корня общей папки (пусто — не нужно)" ""
+INSTALL_DOCKER_INDEX_DIR=${INSTALL_DOCKER_INDEX_DIR%/}
+# относительный путь - от SHARE_ROOT (точка монтирования задаётся только в SHARE_ROOT); абсолютный - как есть
+DOCKER_DIR=""
+if [ -n "$INSTALL_DOCKER_INDEX_DIR" ]; then
+  case "$INSTALL_DOCKER_INDEX_DIR" in /*) DOCKER_DIR=$INSTALL_DOCKER_INDEX_DIR;; *) DOCKER_DIR=$SHARE_ROOT/$INSTALL_DOCKER_INDEX_DIR;; esac
+fi
 ask_yn INSTALL_SAMBA "Настроить Samba-шару для этой папки (гость — чтение, $SHARE_USER — запись)?" n
 if [ "$INSTALL_SAMBA" = y ]; then
   ask INSTALL_SMB_NAME "Имя Samba-шары" "$(basename "$SHARE_ROOT" | tr -c 'A-Za-z0-9_\n-' _)"
@@ -198,6 +275,7 @@ ask SHARE_SMB_PATHS "Пути Samba для показа в шапке (чере�
 
 setting SHARE_SESSION_HOURS 12
 setting SHARE_COMMENTS_FILE ""
+setting SHARE_HIDE "lost+found"
 setting SHARE_LOG_LEVEL INFO
 SHARE_LOG_LEVEL=${SHARE_LOG_LEVEL^^}
 case $SHARE_LOG_LEVEL in ERROR|WARNING|INFO|DEBUG) ;; *) warn "SHARE_LOG_LEVEL=$SHARE_LOG_LEVEL - нет такого уровня, будет INFO"; SHARE_LOG_LEVEL=INFO ;; esac
@@ -207,15 +285,16 @@ setting INSTALL_LOG_DIR "$INSTALL_DIR/log"
 INSTALL_LOG_DIR=${INSTALL_LOG_DIR%/}
 [ -z "$INSTALL_LOG_DIR" ] && INSTALL_LOG_DIR=journal
 RUN_USER=$INSTALL_RUN_USER
+NOLOGIN=$(command -v nologin 2>/dev/null || echo /sbin/nologin)
 # ---------------------------------------------------------------- установка
-need_pkgs python3 python3-venv ca-certificates
-[ -n "$INSTALL_DOCKER_INDEX_DIR" ] && need_pkgs cron
-[ "$INSTALL_LOG_DIR" != journal ] && need_pkgs logrotate
-[ "$INSTALL_SAMBA" = y ] && need_pkgs samba
+need python certs useradd
+[ -n "$INSTALL_DOCKER_INDEX_DIR" ] && need cron tools
+[ "$INSTALL_LOG_DIR" != journal ] && need logrotate
+[ "$INSTALL_SAMBA" = y ] && need samba
 
 say "Пользователь $RUN_USER и общая папка $SHARE_ROOT"
 if ! id "$RUN_USER" >/dev/null 2>&1; then
-  useradd -r -M -U -d /nonexistent -s /usr/sbin/nologin "$RUN_USER"
+  useradd -r -M -U -d /nonexistent -s "$NOLOGIN" "$RUN_USER"
   echo "создан системный пользователь $RUN_USER"
 fi
 RUN_GROUP=$(id -gn "$RUN_USER")
@@ -227,7 +306,7 @@ elif ! runuser -u "$RUN_USER" -- test -w "$SHARE_ROOT"; then
   if [ "$INSTALL_CHOWN" = y ]; then chown -R "$RUN_USER:$RUN_GROUP" "$SHARE_ROOT"; chmod 2775 "$SHARE_ROOT"
   else warn "$RUN_USER не сможет записывать в $SHARE_ROOT - загрузка и изменения работать не будут"; fi
 fi
-for d in ${SHARE_UPLOAD_DIR:+"$SHARE_ROOT/$SHARE_UPLOAD_DIR"} ${INSTALL_DOCKER_INDEX_DIR:+"$INSTALL_DOCKER_INDEX_DIR"}; do
+for d in ${SHARE_UPLOAD_DIR:+"$SHARE_ROOT/$SHARE_UPLOAD_DIR"} ${DOCKER_DIR:+"$DOCKER_DIR"}; do
   [ -d "$d" ] && continue
   install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 2775 "$d"
   echo "создана $d"
@@ -243,7 +322,7 @@ umask 077
 {
   echo "# $APP: настройки (создано start.sh $(date '+%F %T')). После правки: systemctl restart $SERVICE"
   for k in SHARE_ROOT SHARE_PORT SHARE_BIND SHARE_ALLOW SHARE_TITLE SHARE_SMB_PATHS SHARE_USER SHARE_PASS \
-           SHARE_UPLOAD_USER SHARE_UPLOAD_PASS SHARE_UPLOAD_DIR SHARE_SESSION_HOURS SHARE_COMMENTS_FILE SHARE_LOG_LEVEL; do echo "$k=${!k}"; done
+           SHARE_UPLOAD_USER SHARE_UPLOAD_PASS SHARE_UPLOAD_DIR SHARE_SESSION_HOURS SHARE_COMMENTS_FILE SHARE_HIDE SHARE_LOG_LEVEL; do echo "$k=${!k}"; done
   echo "# для start.sh (приложение не читает)"
   for k in INSTALL_SERVICE INSTALL_RUN_USER INSTALL_DOCKER_INDEX_DIR INSTALL_SAMBA INSTALL_SMB_NAME INSTALL_SMB_WORM_GRACE \
            INSTALL_LOG_DIR; do echo "$k=${!k-}"; done
@@ -275,6 +354,8 @@ $INSTALL_LOG_DIR/*.log {
 }
 ROT_END
   chmod 644 "$LOGROT"
+  # Fedora, Arch, openSUSE: logrotate запускает таймер systemd (в Debian - тоже он или cron.daily)
+  sctl enable --now logrotate.timer >/dev/null 2>&1 || true
   echo "логи: $INSTALL_LOG_DIR (ротация - $LOGROT)"
 else
   rm -f "$LOGROT"
@@ -305,15 +386,20 @@ $LOG_UNIT
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable "$SERVICE" >/dev/null 2>&1
-systemctl restart "$SERVICE"
+if [ "$SYSTEMD" = 1 ]; then
+  systemctl daemon-reload
+  systemctl enable "$SERVICE" >/dev/null 2>&1
+  systemctl restart "$SERVICE"
+  open_port "$SHARE_PORT/tcp"
+else
+  warn "systemd не запущен (контейнер?): служба записана в $UNIT, но не запущена"
+fi
 
 if [ -n "$INSTALL_DOCKER_INDEX_DIR" ]; then
-  echo "*/5 * * * * $RUN_USER $INSTALL_DIR/share-images-index.sh $INSTALL_DOCKER_INDEX_DIR$CRON_LOG" > "$CRON"
+  echo "*/5 * * * * $RUN_USER $INSTALL_DIR/share-images-index.sh $DOCKER_DIR$CRON_LOG" > "$CRON"
   chmod 644 "$CRON"
-  systemctl enable --now cron >/dev/null 2>&1 || true
-  echo "cron: $CRON (индекс $INSTALL_DOCKER_INDEX_DIR/images.list раз в 5 минут)"
+  sctl enable --now "$(unit_of cron crond cronie)" >/dev/null 2>&1 || true
+  echo "cron: $CRON (индекс $DOCKER_DIR/images.list раз в 5 минут)"
 else
   rm -f "$CRON"
 fi
@@ -322,9 +408,13 @@ fi
 if [ "$INSTALL_SAMBA" = y ]; then
   say "Samba"
   smb_user() {  # smb_user логин пароль
-    id "$1" >/dev/null 2>&1 || { useradd -r -M -d /nonexistent -s /usr/sbin/nologin "$1"; echo "создан системный пользователь $1"; }
+    id "$1" >/dev/null 2>&1 || { useradd -r -M -d /nonexistent -s "$NOLOGIN" "$1"; echo "создан системный пользователь $1"; }
     printf '%s\n%s\n' "$2" "$2" | smbpasswd -s -a "$1" >/dev/null; smbpasswd -e "$1" >/dev/null
   }
+  if [ ! -f /etc/samba/smb.conf ]; then   # Arch: пакет samba без smb.conf
+    install -d /etc/samba
+    printf '# создано start.sh (%s)\n[global]\n   workgroup = WORKGROUP\n   server string = %%h\n   map to guest = Bad User\n' "$APP" > /etc/samba/smb.conf
+  fi
   smb_user "$SHARE_USER" "$SHARE_PASS"
   allow=$(echo "$SHARE_ALLOW" | tr ',' ' ')
   {
@@ -339,14 +429,13 @@ if [ "$INSTALL_SAMBA" = y ]; then
     echo "   create mask = 0664"
     echo "   directory mask = 2775"
     echo "   hosts allow = $allow"
+    veto=""; for h in ${SHARE_HIDE//,/ }; do veto+="/$h"; done
+    [ -n "$veto" ] && echo "   veto files = $veto/"
   } > "$SMBINC"
   if [ -n "$SHARE_UPLOAD_USER" ]; then
-    # vfs_worm в Debian 10-12 - в отдельном пакете samba-vfs-modules (в 13 - уже в samba)
-    if ! find /usr/lib -path '*samba/vfs/worm.so' 2>/dev/null | grep -q . && \
-       apt-cache show samba-vfs-modules >/dev/null 2>&1; then
-      need_pkgs samba-vfs-modules
-    fi
-    if find /usr/lib -path '*samba/vfs/worm.so' 2>/dev/null | grep -q .; then
+    # vfs_worm в Debian 10-12 - в отдельном пакете samba-vfs-modules (в 13 и других дистрибутивах - уже в samba)
+    worm_so || apt_optional samba-vfs-modules || true
+    if worm_so; then
       smb_user "$SHARE_UPLOAD_USER" "$SHARE_UPLOAD_PASS"
       cat >> "$SMBINC" <<EOF
 
@@ -373,17 +462,25 @@ EOF
     sed -i '0,/^\[global\]/s//[global]\n   map to guest = Bad User/' /etc/samba/smb.conf
   fi
   testparm -s >/dev/null 2>&1 || die "testparm нашёл ошибку в конфиге Samba"
-  systemctl enable smbd >/dev/null 2>&1; systemctl restart smbd
+  # SELinux (Fedora/RHEL): без этого smbd не пустят в общую папку
+  if have selinuxenabled && selinuxenabled && have setsebool; then setsebool -P samba_export_all_rw on || true; fi
+  SMBD=$(unit_of smbd smb)
+  sctl enable "$SMBD" >/dev/null 2>&1; sctl restart "$SMBD" || true
+  [ "$SYSTEMD" = 1 ] && open_port 445/tcp samba
   echo "Samba: $SMBINC (подключён из /etc/samba/smb.conf)"
 elif [ -f "$SMBINC" ]; then
   rm -f "$SMBINC"; sed -i "\|^[[:space:]]*include = $SMBINC\$|d" /etc/samba/smb.conf
-  systemctl reload smbd 2>/dev/null || true
+  sctl reload "$(unit_of smbd smb)" 2>/dev/null || true
 fi
 
 # ---------------------------------------------------------------- проверка
+if [ "$SYSTEMD" = 0 ]; then
+  echo "Запуск вручную: runuser -u $RUN_USER -- $INSTALL_DIR/venv/bin/python3 -I $INSTALL_DIR/share-web.py"
+  exit 0
+fi
 say "Проверка"
 ok=0
-for i in $(seq 1 20); do
+for _ in $(seq 1 20); do
   if "$INSTALL_DIR/venv/bin/python3" -c "import urllib.request,sys; urllib.request.urlopen(sys.argv[1], timeout=3)" \
        "http://127.0.0.1:$SHARE_PORT/" 2>/dev/null; then ok=1; break; fi
   sleep 1

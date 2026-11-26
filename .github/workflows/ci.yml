@@ -1,0 +1,134 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  schedule:
+    - cron: "0 5 * * 1" # по понедельникам: ловит изменения в дистрибутивах
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bash -n
+        run: bash -n start.sh install.sh share-images-index.sh tests/container.sh
+      - name: shellcheck
+        run: shellcheck -x start.sh install.sh share-images-index.sh tests/container.sh
+      - name: ruff
+        run: pipx run ruff check --select F,E,W --line-length 120 share-web.py tests/test_web.py
+      - name: share-web.py совместим с Python 3.7 (Debian 10)
+        run: pipx run vermin --target=3.7- --no-tips --violations share-web.py
+
+  tests:
+    name: tests (${{ matrix.os }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ["3.8", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: tests/test_web.py
+        run: python tests/test_web.py -v
+
+  tests-py37:
+    name: tests (python 3.7, как в Debian 10)
+    runs-on: ubuntu-latest
+    container: python:3.7-slim
+    steps:
+      - uses: actions/checkout@v4
+      - run: python tests/test_web.py -v
+
+  distros:
+    name: start.sh (${{ matrix.image }})
+    runs-on: ubuntu-latest
+    container: ${{ matrix.image }}
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [debian:10, debian:12, debian:13, ubuntu:24.04, fedora:latest, archlinux:latest, opensuse/tumbleweed]
+    steps:
+      - uses: actions/checkout@v4
+      - name: tests/container.sh (пакеты ставит сам start.sh)
+        run: bash tests/container.sh
+
+  linux-systemd:
+    name: install.sh + настоящий systemd
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install.sh (из этой копии)
+        run: |
+          printf 'SHARE_ROOT=/srv/share-ci\nSHARE_PORT=18081\nSHARE_PASS=adminpw\nINSTALL_SAMBA=y\n' > /tmp/answers.env
+          sudo WEBSHARE_SRC=$PWD bash install.sh -y --answers /tmp/answers.env
+      - name: служба работает
+        run: |
+          systemctl is-active web-share
+          curl -fsS http://127.0.0.1:18081/api/version
+          systemctl is-active smbd
+      - name: повторный запуск (обновление)
+        run: sudo WEBSHARE_SRC=$PWD bash install.sh -y && systemctl is-active web-share
+      - name: удаление
+        run: |
+          sudo bash start.sh -y --uninstall
+          ! systemctl is-active web-share
+
+  windows:
+    name: Windows (install.ps1 + задача планировщика)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: скрипты разбираются в Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          foreach ($f in "start.ps1", "install.ps1") {
+            $t = $null; $e = $null
+            [void][Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f), [ref]$t, [ref]$e)
+            if ($e) { $e | ForEach-Object { Write-Host "$f : $_" }; exit 1 }
+          }
+      - name: PSScriptAnalyzer
+        shell: powershell
+        run: |
+          $r = "start.ps1", "install.ps1" | ForEach-Object { Invoke-ScriptAnalyzer -Path $_ -Severity Warning,Error -ExcludeRule `
+            PSAvoidUsingWriteHost, PSUseShouldProcessForStateChangingFunctions, PSUseApprovedVerbs, PSUseSingularNouns, `
+            PSAvoidUsingPlainTextForPassword, PSAvoidUsingPositionalParameters, PSAvoidUsingEmptyCatchBlock, PSUseBOMForUnicodeEncodedFile }
+          $r | Format-Table -AutoSize -Wrap | Out-String -Width 200
+          if ($r) { exit 1 }
+      - name: install.ps1 -Yes (из этой копии; Python ставится, если его нет)
+        shell: powershell
+        run: |
+          Set-Content -Path answers.env -Value "SHARE_ROOT=C:\ShareCI`nSHARE_PORT=18081`nSHARE_PASS=adminpw"
+          $env:WEBSHARE_SRC = $PWD.Path
+          & ([scriptblock]::Create((Get-Content -Raw install.ps1))) -Yes -Answers "$PWD\answers.env"
+      - name: служба отвечает, вход и загрузка
+        shell: powershell
+        run: |
+          (Get-ScheduledTask -TaskName web-share).State
+          Invoke-RestMethod http://127.0.0.1:18081/api/version
+          $s = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+          Invoke-RestMethod -Method Post -WebSession $s -ContentType application/json -Body '{"user":"admin","pass":"adminpw"}' http://127.0.0.1:18081/api/login
+          Invoke-RestMethod -Method Put -WebSession $s -Body "hi" "http://127.0.0.1:18081/api/upload?path=&name=hello.txt"
+          if ((Get-Content C:\ShareCI\hello.txt) -ne "hi") { exit 1 }
+          Get-Content "$env:ProgramFiles\web-share\log\web-share.log" -Tail 5
+      - name: повторный запуск (обновление)
+        shell: powershell
+        run: |
+          & .\start.ps1 -Yes
+          Invoke-RestMethod http://127.0.0.1:18081/api/version
+      - name: удаление
+        shell: powershell
+        run: |
+          & .\start.ps1 -Yes -Uninstall
+          if (Get-ScheduledTask -TaskName web-share -ErrorAction SilentlyContinue) { exit 1 }
+          if (Test-Path "$env:ProgramFiles\web-share") { exit 1 }

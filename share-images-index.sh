@@ -16,7 +16,7 @@ find "$D" -mindepth 1 -type f ! -path '*/.*' \( -name '*.tar' -o -name '*.tgz' -
 while IFS= read -r b; do
   case "$b" in *[[:space:]]*) echo "Пропуск (пробел в пути): $b" >&2; continue ;; esac
   f="$D/$b"
-  set -- $(stat -c '%s %Y' "$f"); size=$1; mtime=$2
+  read -r size mtime < <(stat -c '%s %Y' "$f")
   # файл ещё копируется
   [ $((now - mtime)) -lt 120 ] && continue
   if [ -f "$L" ] && awk -v f="$b" -v s="$size" -v m="$mtime" '$2==f && $3==s && $4==m {found=1} END {exit !found}' "$L"; then

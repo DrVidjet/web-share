@@ -3,8 +3,9 @@
 
 Загрузка, скачивание (папки - zip), создание папок, переименование, удаление,
 копирование / вырезание / вставка, просмотр содержимого архивов (zip, tar, tar.gz/bz2/xz, gz),
-скачивание отдельного файла из архива, страница «поделиться». Только stdlib python3 (>= 3.7).
-Настройки - .env рядом со скриптом (пишет start.sh, все ключи - в .env.example) или переменные окружения SHARE_*.
+скачивание отдельного файла из архива, страница «поделиться». Только stdlib python3 (>= 3.7), Linux и Windows.
+Настройки - .env рядом со скриптом (пишет start.sh / start.ps1, все ключи - в .env.example)
+или переменные окружения SHARE_*.
 """
 import hmac
 import ipaddress
@@ -26,7 +27,9 @@ import gzip
 import hashlib
 import struct
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging.handlers import RotatingFileHandler
 
+WIN = os.name == "nt"
 
 
 def load_conf():
@@ -54,25 +57,36 @@ def load_conf():
 C = load_conf()
 
 
-def setup_logging(level):
-    """Уровень: ERROR / WARNING / INFO / DEBUG. Вывод - stderr (systemd пишет его в файл лога или журнал);
-    в журнал - без времени, его journald ставит сам."""
+def setup_logging(level, path=""):
+    """Уровень: ERROR / WARNING / INFO / DEBUG. Вывод - stderr (systemd пишет его в файл лога или журнал;
+    в журнал - без времени, его journald ставит сам) или файл path с ротацией (Windows: 20 МБ, хранит 8)."""
     lvl = logging.getLevelName(str(level).strip().upper())
     fmt = "%(levelname)s %(message)s" if os.environ.get("JOURNAL_STREAM") else "%(asctime)s %(levelname)s %(message)s"
-    logging.basicConfig(level=lvl if isinstance(lvl, int) else logging.INFO, format=fmt, datefmt="%Y-%m-%d %H:%M:%S")
+    handlers = None
+    if path:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        handlers = [RotatingFileHandler(path, maxBytes=20 << 20, backupCount=8, encoding="utf-8")]
+    logging.basicConfig(level=lvl if isinstance(lvl, int) else logging.INFO, format=fmt, datefmt="%Y-%m-%d %H:%M:%S",
+                        handlers=handlers)
     if not isinstance(lvl, int):
         logging.warning("SHARE_LOG_LEVEL=%s - нет такого уровня (ERROR/WARNING/INFO/DEBUG), взят INFO", level)
 
 
-setup_logging(C.get("SHARE_LOG_LEVEL", "INFO"))
+setup_logging(C.get("SHARE_LOG_LEVEL", "INFO"), C.get("SHARE_LOG_FILE", ""))
 log = logging.getLogger("share-web")
-ROOT = os.path.realpath(C.get("SHARE_ROOT", "/srv/share"))
+ROOT = os.path.realpath(C.get("SHARE_ROOT", r"C:\Share" if WIN else "/srv/share"))
+ROOT_SEP = ROOT if ROOT.endswith(os.sep) else ROOT + os.sep  # корень диска (D:\\) уже с разделителем
 BIND = C.get("SHARE_BIND", "0.0.0.0")
 PORT = int(C.get("SHARE_PORT", "8081"))
 # с каких адресов можно открыть страницу (CIDR через запятую)
 ALLOW = [ipaddress.ip_network(n.strip(), strict=False)
          for n in C.get("SHARE_ALLOW", "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,127.0.0.0/8").split(",") if n.strip()]
 TITLE = C.get("SHARE_TITLE") or os.path.basename(ROOT) or "share"
+# имена в корне общей папки, которых для веба как бы нет (lost+found, если корень - сам раздел;
+# в Windows - служебные папки корня диска). В Windows имена без учёта регистра.
+HIDE = {x.strip().casefold() if WIN else x.strip()
+        for x in C.get("SHARE_HIDE", "lost+found,$RECYCLE.BIN,System Volume Information" if WIN else "lost+found")
+        .split(",") if x.strip()}
 SMB_PATHS = [x.strip() for x in C.get("SHARE_SMB_PATHS", "").split(",") if x.strip()]  # только для показа в шапке
 CHUNK = 1024 * 1024
 # вход для изменения файлов (без входа - только просмотр и скачивание)
@@ -82,7 +96,7 @@ ADMIN_PASS = C.get("SHARE_PASS", "")
 # без переименования, удаления, копирования/перемещения и перезаписи существующих файлов. Пустой логин - выключено.
 UPLOAD_USER = C.get("SHARE_UPLOAD_USER", "")
 UPLOAD_PASS = C.get("SHARE_UPLOAD_PASS", "")
-UPLOAD_DIR = os.path.join(ROOT, C.get("SHARE_UPLOAD_DIR", "upload").strip("/"))
+UPLOAD_DIR = os.path.normpath(os.path.join(ROOT, C.get("SHARE_UPLOAD_DIR", "upload").strip("/\\")))
 USERS = {}
 if UPLOAD_USER and UPLOAD_PASS:
     USERS[UPLOAD_USER] = (UPLOAD_PASS, "upload")
@@ -158,24 +172,47 @@ class Err(Exception):
         self.msg = msg
 
 
+def hidden(name):
+    """Имя в корне общей папки, скрытое SHARE_HIDE."""
+    return (name.casefold() if WIN else name) in HIDE
+
+
 def resolve(rel, must_exist=True):
-    rel = (rel or "").strip("/")
+    rel = rel or ""
+    if WIN:
+        # в Windows "\\" - тоже разделитель; ":" - диск ("C:x") или поток NTFS ("файл:поток") - не пускаем
+        rel = rel.replace("\\", "/")
+        if ":" in rel:
+            raise Err(400, "Недопустимый путь: " + rel)
+    rel = rel.strip("/")
+    if hidden(rel.split("/", 1)[0]):
+        raise Err(404, "Не найдено: /" + rel)
     p = os.path.realpath(os.path.join(ROOT, rel))
-    if p != ROOT and not p.startswith(ROOT + os.sep):
+    if p != ROOT and not p.startswith(ROOT_SEP):
         raise Err(403, "Путь вне общей папки")
+    # ещё раз - по настоящему имени: ссылка на скрытое, "LOST+FOUND" и "lost+found." в Windows
+    if p != ROOT and hidden(relpath(p).split("/", 1)[0]):
+        raise Err(404, "Не найдено: /" + rel)
     if must_exist and not os.path.lexists(p):
         raise Err(404, "Не найдено: /" + rel)
     return p
 
 
 def relpath(p):
+    """Путь от корня общей папки, всегда через "/" (и в Windows)."""
     r = os.path.relpath(p, ROOT)
-    return "" if r == "." else r
+    return "" if r == "." else r.replace(os.sep, "/")
+
+
+WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"%s%d" % (d, i) for d in ("COM", "LPT") for i in range(1, 10)}
 
 
 def check_name(name):
     if not name or name in (".", "..") or "/" in name or "\0" in name:
         raise Err(400, "Недопустимое имя: %r" % name)
+    if WIN and (any(c in name for c in '\\:*?"<>|') or any(ord(c) < 32 for c in name) or name[-1] in ". "
+                or name.split(".", 1)[0].rstrip(" ").upper() in WIN_RESERVED):
+        raise Err(400, "Недопустимое имя для Windows: %r" % name)
     return name
 
 
@@ -345,6 +382,9 @@ class ZipPlan:
         base = os.path.basename(p) or "share"
         self.ents = []
         for d, dirs, files in os.walk(p):
+            if d == ROOT:
+                dirs[:] = [x for x in dirs if not hidden(x)]
+                files = [x for x in files if not hidden(x)]
             dirs.sort()
             arc = (base + "/" + os.path.relpath(d, p).replace(os.sep, "/")) if d != p else base
             if not files and not dirs:
@@ -684,6 +724,8 @@ class H(BaseHTTPRequestHandler):
             code, msg = 403, "Нет прав: %s" % e
         elif isinstance(e, FileNotFoundError):
             code, msg = 404, "Не найдено: %s" % e
+        elif isinstance(e, FileExistsError):
+            code, msg = 409, "Уже существует: %s" % os.path.basename(e.filename or "")
         else:
             code, msg = 500, "%s: %s" % (type(e).__name__, e)
         route = urllib.parse.urlsplit(self.path).path
@@ -840,6 +882,8 @@ class H(BaseHTTPRequestHandler):
         base = relpath(p)
         with os.scandir(p) as it:
             for de in it:
+                if not base and hidden(de.name):
+                    continue
                 try:
                     st = de.stat(follow_symlinks=True)
                     isdir = stat.S_ISDIR(st.st_mode)
@@ -847,7 +891,7 @@ class H(BaseHTTPRequestHandler):
                             "size": dir_size(de.path) if isdir else st.st_size, "mtime": st.st_mtime}
                 except OSError:
                     item = {"name": de.name, "dir": False, "size": 0, "mtime": 0}
-                item["comment"] = COMMENTS.get(os.path.join(base, de.name), "")
+                item["comment"] = COMMENTS.get(base + "/" + de.name if base else de.name, "")
                 items.append(item)
         du = shutil.disk_usage(p)
         self.send_json({"path": relpath(p), "items": items,
@@ -990,7 +1034,7 @@ class H(BaseHTTPRequestHandler):
             if not parts or any(x in (".", "..") or "\0" in x for x in parts):
                 continue
             p = os.path.join(base, *parts)
-            if os.path.realpath(p).startswith(ROOT + os.sep) and os.path.lexists(p):
+            if os.path.realpath(p).startswith(ROOT_SEP) and os.path.lexists(p):
                 out.append(name)
         self.send_json({"exists": out})
 
@@ -1003,7 +1047,7 @@ class H(BaseHTTPRequestHandler):
         if not parts:
             raise Err(400, "Нет имени файла")
         dst = os.path.realpath(os.path.join(d, *parts))
-        if not dst.startswith(ROOT + os.sep):
+        if not dst.startswith(ROOT_SEP):
             raise Err(403, "Путь вне общей папки")
         role = self.need_write(dst)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -1025,6 +1069,8 @@ class H(BaseHTTPRequestHandler):
             replaced = os.path.lexists(dst)
             if role == "admin":
                 os.replace(tmp, dst)
+            elif WIN:
+                os.rename(tmp, dst)  # в Windows rename не заменяет существующий файл (FileExistsError)
             else:
                 os.link(tmp, dst)  # не заменит файл, появившийся за время загрузки (FileExistsError)
             log.info("[%s] загружен %s (%d байт%s)", self.who(), relpath(dst), n, ", заменён" if replaced else "")
@@ -1617,6 +1663,9 @@ SHARE_PAGE = SHARE_PAGE.replace("%%BUILD%%", BUILD)
 
 
 class Server(ThreadingHTTPServer):
+    # в Windows SO_REUSEADDR позволяет второму процессу молча занять тот же порт
+    allow_reuse_address = not WIN
+
     def handle_error(self, request, client_address):
         # обрыв соединения клиентом (закрыл вкладку, отменил скачивание) - не ошибка
         ex = sys.exc_info()[1]
