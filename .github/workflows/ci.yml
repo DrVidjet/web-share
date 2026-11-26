@@ -35,8 +35,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
-        python: ["3.9", "3.13"]
+        include:
+          - { os: ubuntu-latest, python: "3.10" }   # старее на ubuntu-latest нет; 3.7 - отдельно, в контейнере
+          - { os: ubuntu-latest, python: "3.13" }
+          - { os: windows-latest, python: "3.8" }
+          - { os: windows-latest, python: "3.13" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

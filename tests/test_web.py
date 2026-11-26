@@ -26,6 +26,11 @@ APP = os.path.join(ROOT, "share-web.py")
 WIN = os.name == "nt"
 
 
+def read(path):
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def free_port():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -209,7 +214,7 @@ class WebShareTest(unittest.TestCase):
     # ---------- скачивание ----------
     def test_download_and_range(self):
         c = self.client()
-        full = open(self.path("big.bin"), "rb").read()
+        full = read(self.path("big.bin"))
         code, body, h = c.req("GET", "/dl?path=big.bin", raw=True)
         self.assertEqual((code, body), (200, full))
         self.assertIn("big.bin", h["Content-Disposition"])
@@ -227,7 +232,7 @@ class WebShareTest(unittest.TestCase):
         z = zipfile.ZipFile(io.BytesIO(body))
         self.assertIsNone(z.testzip())
         self.assertEqual(z.read("docs/a.txt").decode(), "привет")
-        self.assertEqual(z.read("docs/sub/b.bin"), open(self.path("docs", "sub", "b.bin"), "rb").read())
+        self.assertEqual(z.read("docs/sub/b.bin"), read(self.path("docs", "sub", "b.bin")))
         # докачка: кусок с середины совпадает с тем же местом целого архива
         etag = h["ETag"]
         code, part, _ = c.req("GET", "/dl?path=docs", headers={"Range": "bytes=100-", "If-Range": etag}, raw=True)
@@ -271,9 +276,9 @@ class WebShareTest(unittest.TestCase):
         c = self.client("up")
         self.assertEqual(c.upload("", "root.txt", b"x")[0], 403)
         self.assertEqual(c.upload("upload", "sub/new.txt", b"new")[0], 200)
-        self.assertEqual(open(self.path("upload", "sub", "new.txt"), "rb").read(), b"new")
+        self.assertEqual(read(self.path("upload", "sub", "new.txt")), b"new")
         self.assertEqual(c.upload("upload", "sub/new.txt", b"again", overwrite=True)[0], 409)
-        self.assertEqual(open(self.path("upload", "sub", "new.txt"), "rb").read(), b"new")
+        self.assertEqual(read(self.path("upload", "sub", "new.txt")), b"new")
         self.assertEqual(c.post("/api/mkdir", {"path": "upload", "name": "dir"})[0], 200)
         self.assertEqual(c.post("/api/rename", {"path": "upload/dir", "name": "x"})[0], 403)
         self.assertEqual(c.post("/api/delete", {"paths": ["upload/sub/new.txt"]})[0], 403)
@@ -285,7 +290,7 @@ class WebShareTest(unittest.TestCase):
         self.assertEqual(c.upload("work", "deep/f.txt", "файл".encode())[0], 200)
         self.assertEqual(c.upload("work", "deep/f.txt", b"2")[0], 409)
         self.assertEqual(c.upload("work", "deep/f.txt", b"2", overwrite=True)[0], 200)
-        self.assertEqual(open(self.path("work", "deep", "f.txt"), "rb").read(), b"2")
+        self.assertEqual(read(self.path("work", "deep", "f.txt")), b"2")
         self.assertEqual(c.post("/api/exists", {"path": "work", "names": ["deep/f.txt", "nope"]})[1],
                          {"exists": ["deep/f.txt"]})
         # комментарий едет вместе с файлом
@@ -308,8 +313,9 @@ class WebShareTest(unittest.TestCase):
         for n in ("", ".", "..", "a/b"):
             self.assertEqual(c.post("/api/mkdir", {"path": "", "name": n})[0], 400, n)
         if WIN:
-            for n in ("con", "NUL.txt", "a:b", "a*b", "trail.", "trail "):
+            for n in ("con", "NUL.txt", "a:b", "a*b", "trail."):
                 self.assertEqual(c.post("/api/mkdir", {"path": "", "name": n})[0], 400, n)
+            for n in ("con", "NUL.txt", "a:b", "a*b", "trail.", "trail "):  # mkdir сам срезает пробелы
                 self.assertEqual(c.upload("", n, b"x")[0], 400, n)
 
     def test_log_file(self):

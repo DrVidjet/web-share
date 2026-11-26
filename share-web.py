@@ -107,7 +107,7 @@ SESSIONS = {}  # токен -> [время истечения, роль, лог�
 SLOCK = threading.Lock()
 ARCH_LIMIT = 20000
 # комментарии к файлам/папкам: {путь от корня: текст}. По умолчанию - StateDirectory службы (/var/lib/<служба>)
-STATE_DIR = os.environ.get("STATE_DIRECTORY", "").split(":")[0] or os.path.dirname(os.path.realpath(__file__))
+STATE_DIR = os.environ.get("STATE_DIRECTORY", "").split(os.pathsep)[0] or os.path.dirname(os.path.realpath(__file__))
 COMMENTS_FILE = C.get("SHARE_COMMENTS_FILE") or os.path.join(STATE_DIR, "comments.json")
 COMMENT_MAX = 1000
 CLOCK = threading.Lock()
